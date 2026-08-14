@@ -58,7 +58,17 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key>         <string>$VERSION</string>
     <key>LSMinimumSystemVersion</key>  <string>12.0</string>
     <key>NSHighResolutionCapable</key> <true/>
+    <key>NSQuitAlwaysKeepsWindows</key> <false/>
+    <key>ApplePersistenceIgnoreState</key> <true/>
     <key>LSApplicationCategoryType</key> <string>public.app-category.utilities</string>
+    <key>NSAppDataUsageDescription</key>
+    <string>Shuffle 需要接收您从微信等应用主动拖入的文件。</string>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>Shuffle 需要在您选择的桌面文件夹中读取和保存文件。</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>Shuffle 需要在您选择的文稿文件夹中读取和保存文件。</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>Shuffle 需要在您选择的下载文件夹中读取和保存文件。</string>
 </dict>
 </plist>
 PLIST
@@ -69,10 +79,14 @@ PLIST
 # instead of re-prompting every run (which ad-hoc signing causes).
 SIGN_ID="${SHUFFLE_SIGN_ID:-Apple Development: Jaime Guzman (7UB4C2P6D6)}"
 if security find-identity -v -p codesigning 2>/dev/null | grep -q "$SIGN_ID"; then
+    # Nested executables must be signed before the enclosing application bundle.
+    # Otherwise codesign refuses to seal the outer bundle.
+    [ ! -f "$APP/Contents/MacOS/removebg" ] || codesign --force --sign "$SIGN_ID" "$APP/Contents/MacOS/removebg"
     codesign --force --sign "$SIGN_ID" --identifier com.shuffle.app "$APP"
     echo "Signed with: $SIGN_ID"
 else
     echo "WARNING: signing identity not found; falling back to ad-hoc (permissions will re-prompt)."
+    [ ! -f "$APP/Contents/MacOS/removebg" ] || codesign --force --sign - "$APP/Contents/MacOS/removebg"
     codesign --force --sign - --identifier com.shuffle.app "$APP"
 fi
 codesign -dv --verbose=2 "$APP" 2>&1 | grep -iE 'Identifier|Authority|Signature' | head -3

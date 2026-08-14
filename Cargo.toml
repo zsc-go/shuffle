@@ -17,9 +17,17 @@ image = { version = "0.25", features = ["tiff"] }
 # Fetch real macOS file icons via NSWorkspace (Apple Silicon / AppKit).
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSData", "NSFileManager", "NSURL", "NSArray"] }
-objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSPDFImageRep", "NSGraphics", "NSGraphicsContext", "NSResponder", "NSView", "NSEvent", "NSApplication", "NSPasteboard", "NSDragging", "NSDraggingItem", "NSDraggingSession"] }
+objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSPDFImageRep", "NSGraphics", "NSGraphicsContext", "NSResponder", "NSView", "NSEvent", "NSApplication", "NSPasteboard", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSFilePromiseReceiver", "NSOpenPanel", "NSSavePanel", "NSPanel", "NSWindow", "block2"] }
+block2 = "0.6"
 # Reach the underlying NSView so we can start native OS drag sessions (drag files out to Finder/other apps).
 raw-window-handle = "0.6"
+
+[features]
+# GPUI normally invokes Apple's `metal` command-line compiler at build time.
+# This opt-in path embeds the source and lets Metal compile it at launch, which
+# keeps local builds possible with Command Line Tools alone. Build with:
+# `cargo build --release --features runtime-shaders`.
+runtime-shaders = ["gpui/runtime_shaders"]
 
 # Ships as a universal binary (arm64 + x86_64) via release.sh so it runs on
 # both Apple Silicon and Intel Macs. Build with a thin release profile while

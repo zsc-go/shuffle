@@ -12,7 +12,9 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -20,22 +22,26 @@ use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Local};
 use gpui::{
-    actions, anchored, div, ease_out_quint, img, point, prelude::*, px, relative, rgb, rgba, size,
+    actions, anchored, canvas, div, ease_out_quint, img, point, prelude::*, px, relative, rgb, rgba, size,
     uniform_list, Animation, AnimationExt, AnyElement, App,
-    Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, ElementId, ExternalPaths, FocusHandle, FontWeight, ImageSource,
+    Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, EntityInputHandler, ExternalPaths, FocusHandle, FontWeight, ImageSource,
     KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit,
-    PathPromptOptions, Rgba,
+    PathPromptOptions, Pixels, Rgba,
     RenderImage, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, TitlebarOptions,
-    UniformListScrollHandle, Window, WindowBounds, WindowOptions,
+    UTF16Selection, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
-use objc2::runtime::NSObjectProtocol;
-use objc2::{define_class, AllocAnyThread, MainThreadOnly};
+use objc2::runtime::{AnyClass, AnyObject, Bool, Imp, NSObjectProtocol, ProtocolObject, Sel};
+use objc2::{define_class, AllocAnyThread, ClassType, MainThreadOnly};
 use objc2_app_kit::{
     NSBitmapImageRep, NSCompositingOperation, NSDeviceRGBColorSpace, NSDraggingContext,
-    NSDraggingSession, NSDraggingSource, NSDragOperation, NSGraphicsContext, NSImage,
-    NSPDFImageRep, NSWorkspace,
+    NSDraggingSession, NSDraggingSource, NSDragOperation, NSFilePromiseReceiver,
+    NSGraphicsContext, NSImage, NSModalResponseOK, NSOpenPanel, NSPasteboard,
+    NSPasteboardWriting, NSPDFImageRep, NSWorkspace,
 };
-use objc2_foundation::{NSData, NSFileManager, NSObject, NSString, NSURL};
+use objc2_foundation::{
+    NSArray, NSData, NSDictionary, NSError, NSFileManager, NSObject, NSOperationQueue, NSString,
+    NSUserDefaults, NSURL,
+};
 use rayon::prelude::*;
 
 const RECENTS_CAP: usize = 12;
@@ -133,7 +139,7 @@ const fn light_theme(bg: u32, text: u32, accent: u32) -> Theme {
 const PRESETS: &[(&str, Theme)] = &[
     // --- Hand-tuned signatures ---
     (
-        "Shuffle Dark",
+        "Shuffle 深色",
         Theme {
             bg: 0x1e1e22,
             sidebar: 0x17171a,
@@ -149,7 +155,7 @@ const PRESETS: &[(&str, Theme)] = &[
         },
     ),
     (
-        "Catppuccin Mocha",
+        "Catppuccin 摩卡",
         Theme {
             bg: 0x1e1e2e,
             sidebar: 0x181825,
@@ -165,7 +171,7 @@ const PRESETS: &[(&str, Theme)] = &[
         },
     ),
     (
-        "Catppuccin Macchiato",
+        "Catppuccin 玛奇朵",
         Theme {
             bg: 0x24273a,
             sidebar: 0x1e2030,
@@ -181,7 +187,7 @@ const PRESETS: &[(&str, Theme)] = &[
         },
     ),
     (
-        "Catppuccin Frappé",
+        "Catppuccin 冰咖啡",
         Theme {
             bg: 0x303446,
             sidebar: 0x292c3c,
@@ -197,7 +203,7 @@ const PRESETS: &[(&str, Theme)] = &[
         },
     ),
     (
-        "Catppuccin Latte",
+        "Catppuccin 拿铁",
         Theme {
             bg: 0xeff1f5,
             sidebar: 0xe6e9ef,
@@ -213,31 +219,31 @@ const PRESETS: &[(&str, Theme)] = &[
         },
     ),
     // --- Popular dark themes (varied accent hues) ---
-    ("Dracula", dark_theme(0x282a36, 0xf8f8f2, 0xbd93f9)),
-    ("Nord", dark_theme(0x2e3440, 0xe5e9f0, 0x88c0d0)),
-    ("Tokyo Night", dark_theme(0x1a1b26, 0xc0caf5, 0x7aa2f7)),
-    ("Gruvbox Dark", dark_theme(0x282828, 0xebdbb2, 0xfe8019)),
-    ("One Dark", dark_theme(0x282c34, 0xabb2bf, 0x61afef)),
-    ("Solarized Dark", dark_theme(0x002b36, 0x93a1a1, 0x268bd2)),
+    ("德古拉", dark_theme(0x282a36, 0xf8f8f2, 0xbd93f9)),
+    ("北境", dark_theme(0x2e3440, 0xe5e9f0, 0x88c0d0)),
+    ("东京之夜", dark_theme(0x1a1b26, 0xc0caf5, 0x7aa2f7)),
+    ("Gruvbox 深色", dark_theme(0x282828, 0xebdbb2, 0xfe8019)),
+    ("One 深色", dark_theme(0x282c34, 0xabb2bf, 0x61afef)),
+    ("Solarized 深色", dark_theme(0x002b36, 0x93a1a1, 0x268bd2)),
     ("Monokai", dark_theme(0x272822, 0xf8f8f2, 0xa6e22e)),
-    ("Everforest", dark_theme(0x2d353b, 0xd3c6aa, 0xa7c080)),
-    ("Rosé Pine", dark_theme(0x191724, 0xe0def4, 0xeb6f92)),
+    ("常青林", dark_theme(0x2d353b, 0xd3c6aa, 0xa7c080)),
+    ("玫瑰松", dark_theme(0x191724, 0xe0def4, 0xeb6f92)),
     // --- Bold single-hue darks (green / red / blue / …) ---
-    ("Forest", dark_theme(0x10211a, 0xd6f5e3, 0x4ade80)),
-    ("Crimson", dark_theme(0x211315, 0xf8dcdc, 0xf87171)),
-    ("Ocean", dark_theme(0x0e1a26, 0xd6ecff, 0x38bdf8)),
-    ("Grape", dark_theme(0x1a1326, 0xece0f8, 0xc084fc)),
-    ("Amber", dark_theme(0x221a10, 0xf8ecd6, 0xfbbf24)),
-    ("Rose", dark_theme(0x241620, 0xf8dcee, 0xf472b6)),
-    ("Teal", dark_theme(0x0e201e, 0xd6f5f0, 0x2dd4bf)),
-    ("Sunset", dark_theme(0x241712, 0xfae5d8, 0xfb7185)),
+    ("森林", dark_theme(0x10211a, 0xd6f5e3, 0x4ade80)),
+    ("深红", dark_theme(0x211315, 0xf8dcdc, 0xf87171)),
+    ("海洋", dark_theme(0x0e1a26, 0xd6ecff, 0x38bdf8)),
+    ("葡萄", dark_theme(0x1a1326, 0xece0f8, 0xc084fc)),
+    ("琥珀", dark_theme(0x221a10, 0xf8ecd6, 0xfbbf24)),
+    ("玫瑰", dark_theme(0x241620, 0xf8dcee, 0xf472b6)),
+    ("青绿", dark_theme(0x0e201e, 0xd6f5f0, 0x2dd4bf)),
+    ("日落", dark_theme(0x241712, 0xfae5d8, 0xfb7185)),
     // --- Light themes ---
-    ("Solarized Light", light_theme(0xfdf6e3, 0x586e75, 0x268bd2)),
-    ("GitHub Light", light_theme(0xffffff, 0x24292f, 0x0969da)),
-    ("Rosé Pine Dawn", light_theme(0xfaf4ed, 0x575279, 0xd7827e)),
-    ("Mint", light_theme(0xf0faf4, 0x14532d, 0x16a34a)),
-    ("Sky", light_theme(0xeff6ff, 0x1e3a5f, 0x2563eb)),
-    ("Lavender", light_theme(0xf6f2fe, 0x4c3a66, 0x8b5cf6)),
+    ("Solarized 浅色", light_theme(0xfdf6e3, 0x586e75, 0x268bd2)),
+    ("GitHub 浅色", light_theme(0xffffff, 0x24292f, 0x0969da)),
+    ("玫瑰松·晨曦", light_theme(0xfaf4ed, 0x575279, 0xd7827e)),
+    ("薄荷", light_theme(0xf0faf4, 0x14532d, 0x16a34a)),
+    ("天空", light_theme(0xeff6ff, 0x1e3a5f, 0x2563eb)),
+    ("薰衣草", light_theme(0xf6f2fe, 0x4c3a66, 0x8b5cf6)),
 ];
 
 /// Curated per-property options shown in Settings alongside the presets.
@@ -332,6 +338,8 @@ struct Prefs {
     info: bool,
     /// Show the leading ".." row that goes up one level.
     show_parent: bool,
+    /// Show dot-prefixed files and folders such as `.git` and `.env`.
+    show_hidden: bool,
     /// Collapse the left sidebar to an icon-only rail.
     sidebar_collapsed: bool,
     /// How many Recents to show in the sidebar (0 hides the section).
@@ -364,6 +372,7 @@ impl Default for Prefs {
             preview_pages: true,
             info: false,
             show_parent: true,
+            show_hidden: false,
             sidebar_collapsed: false,
             recent_limit: 3,
             palette_history: false,
@@ -390,6 +399,7 @@ thread_local! {
         preview_pages: true,
         info: false,
         show_parent: true,
+        show_hidden: false,
         sidebar_collapsed: false,
         recent_limit: 3,
         palette_history: false,
@@ -711,6 +721,8 @@ enum KeyAction {
     CloseTab,
     Find,
     SelectAll,
+    Copy,
+    Paste,
     NewFile,
     NewFolder,
     Rename,
@@ -720,6 +732,7 @@ enum KeyAction {
     Compress,
     MoveToTrash,
     RevealInFinder,
+    QuickLook,
     Open,
     // Command-palette (Cmd+P) text editing. These act only while the palette is
     // open, so they're excluded from the normal (global) key dispatch.
@@ -738,6 +751,8 @@ impl KeyAction {
         KeyAction::CloseTab,
         KeyAction::Find,
         KeyAction::SelectAll,
+        KeyAction::Copy,
+        KeyAction::Paste,
         KeyAction::NewFile,
         KeyAction::NewFolder,
         KeyAction::Rename,
@@ -747,6 +762,7 @@ impl KeyAction {
         KeyAction::Compress,
         KeyAction::MoveToTrash,
         KeyAction::RevealInFinder,
+        KeyAction::QuickLook,
         KeyAction::Open,
         KeyAction::PaletteCursorStart,
         KeyAction::PaletteCursorEnd,
@@ -782,6 +798,8 @@ impl KeyAction {
             KeyAction::CloseTab => "close_tab",
             KeyAction::Find => "find",
             KeyAction::SelectAll => "select_all",
+            KeyAction::Copy => "copy",
+            KeyAction::Paste => "paste",
             KeyAction::NewFile => "new_file",
             KeyAction::NewFolder => "new_folder",
             KeyAction::Rename => "rename",
@@ -791,6 +809,7 @@ impl KeyAction {
             KeyAction::Compress => "compress",
             KeyAction::MoveToTrash => "move_to_trash",
             KeyAction::RevealInFinder => "reveal_in_finder",
+            KeyAction::QuickLook => "quick_look",
             KeyAction::Open => "open",
             KeyAction::PaletteCursorStart => "palette_cursor_start",
             KeyAction::PaletteCursorEnd => "palette_cursor_end",
@@ -804,27 +823,30 @@ impl KeyAction {
     /// Human label shown in Settings.
     fn label(self) -> &'static str {
         match self {
-            KeyAction::CommandPalette => "Command palette",
-            KeyAction::NewTab => "New tab",
-            KeyAction::CloseTab => "Close tab",
-            KeyAction::Find => "Filter current folder",
-            KeyAction::SelectAll => "Select all",
-            KeyAction::NewFile => "New file",
-            KeyAction::NewFolder => "New folder",
-            KeyAction::Rename => "Rename",
-            KeyAction::CopyPath => "Copy path",
-            KeyAction::Duplicate => "Duplicate",
-            KeyAction::MakeAlias => "Make alias",
-            KeyAction::Compress => "Compress",
-            KeyAction::MoveToTrash => "Move to Trash",
-            KeyAction::RevealInFinder => "Reveal in Finder",
-            KeyAction::Open => "Open",
-            KeyAction::PaletteCursorStart => "Palette: cursor to start",
-            KeyAction::PaletteCursorEnd => "Palette: cursor to end",
-            KeyAction::PaletteSelectAll => "Palette: select all",
-            KeyAction::PaletteDeleteToStart => "Palette: delete to start",
-            KeyAction::PaletteHistoryPrev => "Palette: previous history",
-            KeyAction::PaletteHistoryNext => "Palette: next history",
+            KeyAction::CommandPalette => "命令面板",
+            KeyAction::NewTab => "新建标签页",
+            KeyAction::CloseTab => "关闭标签页",
+            KeyAction::Find => "筛选当前文件夹",
+            KeyAction::SelectAll => "全选",
+            KeyAction::Copy => "复制文件",
+            KeyAction::Paste => "粘贴文件",
+            KeyAction::NewFile => "新建文件",
+            KeyAction::NewFolder => "新建文件夹",
+            KeyAction::Rename => "重命名",
+            KeyAction::CopyPath => "复制路径",
+            KeyAction::Duplicate => "制作副本",
+            KeyAction::MakeAlias => "制作替身",
+            KeyAction::Compress => "压缩",
+            KeyAction::MoveToTrash => "移到废纸篓",
+            KeyAction::RevealInFinder => "在访达中显示",
+            KeyAction::QuickLook => "快速查看",
+            KeyAction::Open => "打开",
+            KeyAction::PaletteCursorStart => "命令面板：光标移到开头",
+            KeyAction::PaletteCursorEnd => "命令面板：光标移到末尾",
+            KeyAction::PaletteSelectAll => "命令面板：全选",
+            KeyAction::PaletteDeleteToStart => "命令面板：删除至开头",
+            KeyAction::PaletteHistoryPrev => "命令面板：上一条历史记录",
+            KeyAction::PaletteHistoryNext => "命令面板：下一条历史记录",
         }
     }
 
@@ -836,6 +858,9 @@ impl KeyAction {
             KeyAction::CloseTab => Some("cmd-w"),
             KeyAction::Find => Some("/"),
             KeyAction::SelectAll => Some("cmd-a"),
+            KeyAction::Copy => Some("cmd-c"),
+            KeyAction::Paste => Some("cmd-v"),
+            KeyAction::QuickLook => Some("space"),
             KeyAction::PaletteCursorStart => Some("cmd-left"),
             KeyAction::PaletteCursorEnd => Some("cmd-right"),
             KeyAction::PaletteSelectAll => Some("cmd-a"),
@@ -939,6 +964,85 @@ fn char_byte(s: &str, i: usize) -> usize {
     s.char_indices().nth(i).map(|(b, _)| b).unwrap_or(s.len())
 }
 
+/// Convert a UTF-16 offset supplied by macOS text services to a UTF-8 byte
+/// offset. GPUI's IME protocol is UTF-16 while Shuffle's editors use UTF-8.
+fn utf16_byte(s: &str, offset: usize) -> usize {
+    let mut utf16 = 0;
+    for (byte, ch) in s.char_indices() {
+        if utf16 >= offset {
+            return byte;
+        }
+        utf16 += ch.len_utf16();
+    }
+    s.len()
+}
+
+/// Convert a known UTF-8 character boundary to the UTF-16 coordinate system
+/// used by macOS input methods.
+fn byte_utf16(s: &str, byte: usize) -> usize {
+    s[..byte.min(s.len())]
+        .chars()
+        .map(char::len_utf16)
+        .sum()
+}
+
+fn byte_char(s: &str, byte: usize) -> usize {
+    s[..byte.min(s.len())].chars().count()
+}
+
+fn utf16_range_bytes(s: &str, range: Range<usize>) -> Range<usize> {
+    let start = utf16_byte(s, range.start);
+    let end = utf16_byte(s, range.end).max(start);
+    start..end
+}
+
+fn byte_range_utf16(s: &str, range: Range<usize>) -> Range<usize> {
+    byte_utf16(s, range.start)..byte_utf16(s, range.end)
+}
+
+/// Build a Shift-click selection from a stable anchor and target in display
+/// order. Missing anchors fall back to the target instead of selecting an
+/// unrelated range after a directory refresh.
+fn contiguous_selection(
+    paths: &[PathBuf],
+    anchor: Option<&Path>,
+    target: &Path,
+) -> HashSet<PathBuf> {
+    let to = paths.iter().position(|path| path == target);
+    let from = anchor.and_then(|anchor| paths.iter().position(|path| path == anchor));
+    match (from, to) {
+        (Some(a), Some(b)) => {
+            let (lo, hi) = (a.min(b), a.max(b));
+            paths[lo..=hi].iter().cloned().collect()
+        }
+        _ => std::iter::once(target.to_path_buf()).collect(),
+    }
+}
+
+#[cfg(test)]
+mod ime_text_tests {
+    use super::*;
+
+    #[test]
+    fn utf16_offsets_round_trip_for_ascii_cjk_and_emoji() {
+        let text = "a中文😀z";
+        // UTF-8 byte boundaries paired with the UTF-16 offsets exposed by
+        // AppKit. The emoji occupies four UTF-8 bytes but two UTF-16 units.
+        for (utf16, byte) in [(0, 0), (1, 1), (2, 4), (3, 7), (5, 11), (6, 12)] {
+            assert_eq!(utf16_byte(text, utf16), byte);
+            assert_eq!(byte_utf16(text, byte), utf16);
+        }
+    }
+
+    #[test]
+    fn utf16_ranges_keep_cjk_boundaries_intact() {
+        let text = "a中文😀z";
+        let range = utf16_range_bytes(text, 1..5);
+        assert_eq!(&text[range.clone()], "中文😀");
+        assert_eq!(byte_range_utf16(text, range), 1..5);
+    }
+}
+
 /// Canonical string for a keystroke, e.g. "cmd-shift-p" or "/".
 fn canon_keystroke(ks: &gpui::Keystroke) -> String {
     let m = &ks.modifiers;
@@ -957,6 +1061,49 @@ fn canon_keystroke(ks: &gpui::Keystroke) -> String {
     }
     s.push_str(&ks.key);
     s
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::{KeyAction, Keymap};
+
+    #[test]
+    fn quick_look_defaults_to_space() {
+        let keymap = Keymap::defaults();
+        assert!(matches!(
+            keymap.action_for("space"),
+            Some(KeyAction::QuickLook)
+        ));
+    }
+
+    #[test]
+    fn file_copy_and_paste_use_standard_macos_shortcuts() {
+        let keymap = Keymap::defaults();
+        assert!(matches!(keymap.action_for("cmd-c"), Some(KeyAction::Copy)));
+        assert!(matches!(keymap.action_for("cmd-v"), Some(KeyAction::Paste)));
+    }
+}
+
+#[cfg(test)]
+mod file_selection_tests {
+    use super::*;
+
+    #[test]
+    fn shift_selection_includes_both_ends() {
+        let paths = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        let selected = contiguous_selection(&paths, Some(Path::new("b")), Path::new("d"));
+        assert_eq!(selected, ["b", "c", "d"].into_iter().map(PathBuf::from).collect());
+    }
+
+    #[test]
+    fn shift_selection_uses_target_when_anchor_is_stale() {
+        let paths = [PathBuf::from("a"), PathBuf::from("b")];
+        let selected = contiguous_selection(&paths, Some(Path::new("gone")), Path::new("b"));
+        assert_eq!(selected, [PathBuf::from("b")].into_iter().collect());
+    }
 }
 
 /// Which theme color a hex field edits.
@@ -989,16 +1136,16 @@ struct Settings {
 fn tab_sections(tab: usize) -> &'static [&'static str] {
     match tab {
         0 => &[
-            "Explorer",
-            "Inspector",
-            "Command Palette",
-            "Sidebar",
-            "Connections",
-            "Script Actions",
-            "Software Update",
-            "Developer",
+            "文件浏览",
+            "检查器",
+            "命令面板",
+            "侧边栏",
+            "连接",
+            "脚本操作",
+            "软件更新",
+            "开发者",
         ],
-        2 => &["Theme", "Colors", "Menu", "App Icon", "Icon Pack"],
+        2 => &["主题", "颜色", "菜单", "应用图标", "图标包"],
         _ => &[],
     }
 }
@@ -1146,7 +1293,7 @@ impl Settings {
 impl Render for Settings {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme();
-        let tabs = [("General", "\u{2699}"), ("Keybinds", "\u{2318}"), ("Customization", "\u{25d0}")];
+        let tabs = [("常规", "\u{2699}"), ("快捷键", "\u{2318}"), ("个性化", "\u{25d0}")];
 
         // Left tab rail.
         let mut tab_items: Vec<AnyElement> = Vec::new();
@@ -1233,7 +1380,7 @@ impl Render for Settings {
                     .text_base()
                     .font_weight(FontWeight::BOLD)
                     .text_color(rgb(t.text))
-                    .child("Settings"),
+                    .child("设置"),
             )
             .children(tab_items);
 
@@ -1295,11 +1442,9 @@ impl Settings {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .child(div().text_color(rgb(t.text)).child("Scripts folder"))
+                    .child(div().text_color(rgb(t.text)).child("脚本文件夹"))
                     .child(div().text_xs().text_color(rgb(t.text_muted)).child(format!(
-                        "{} script{} loaded — the README there explains the format.",
-                        script_count,
-                        if script_count == 1 { "" } else { "s" }
+                        "已加载 {script_count} 个脚本；其中的 README 说明了脚本格式。"
                     ))),
             )
             .child(
@@ -1314,7 +1459,7 @@ impl Settings {
                     .text_color(rgb(t.text))
                     .hover(|s| s.bg(rgb(t.hover)))
                     .active(|s| s.bg(rgb(t.selected)))
-                    .child("Open Scripts Folder")
+                    .child("打开脚本文件夹")
                     .on_click(cx.listener(|_, _: &ClickEvent, _, _| {
                         if let Some(dir) = ensure_scripts_dir() {
                             let _ = Command::new("open").arg(&dir).spawn();
@@ -1329,10 +1474,8 @@ impl Settings {
         connection_rows.push(
             toggle_row(
                 "tg-ssh-system",
-                "Use my ~/.ssh configuration",
-                "On: connect using your existing SSH keys, ~/.ssh/config aliases, and \
-                 known_hosts — nothing is stored in the app. Off: use the private-key \
-                 path you set per server.",
+                "使用我的 ~/.ssh 配置",
+                "开启后使用现有 SSH 密钥、~/.ssh/config 别名和 known_hosts 连接，应用不会保存这些内容；关闭后使用每台服务器单独设置的私钥路径。",
                 p.ssh_use_system,
                 cx.listener(|_, _: &ClickEvent, _, cx| {
                     let mut np = prefs();
@@ -1351,8 +1494,7 @@ impl Settings {
                     .text_xs()
                     .text_color(rgb(t.text_dim))
                     .child(
-                        "No saved servers yet. Add one from the sidebar: Connect to \
-                         Server\u{2026} then enter sftp://user@host (or an ~/.ssh alias).",
+                        "尚未保存服务器。可在侧边栏选择“连接到服务器…”，然后输入 sftp://user@host（或 ~/.ssh 别名）。",
                     )
                     .into_any_element(),
             );
@@ -1394,7 +1536,7 @@ impl Settings {
                                 .hover(|s| s.border_color(rgb(0xd9544f)).text_color(rgb(0xd9544f)))
                                 .border_1()
                                 .border_color(rgb(t.border))
-                                .child("Remove")
+                                .child("移除")
                                 .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
                                     if srv.use_password {
                                         keychain_delete_password(&srv);
@@ -1414,18 +1556,18 @@ impl Settings {
 
         vec![
             settings_header(
-                "General",
-                "How the explorer behaves and what the side panels show.",
+                "常规",
+                "设置文件浏览器的行为及侧面板显示内容。",
             )
             .into_any_element(),
             settings_section(
-                "Explorer",
-                Some("Navigation and the file list."),
+                "文件浏览",
+                Some("导航和文件列表。"),
                 vec![
                     toggle_row(
                         "tg-show-parent",
-                        "Show \u{201c}..\u{201d} (up one level)",
-                        "Show the leading \u{201c}..\u{201d} entry in list view that navigates to the parent folder.",
+                        "显示“..”（返回上一级）",
+                        "在列表视图首行显示“..”，用于返回上一级文件夹。",
                         p.show_parent,
                         cx.listener(|_, _: &ClickEvent, _, cx| {
                             let mut np = prefs();
@@ -1436,9 +1578,22 @@ impl Settings {
                     )
                     .into_any_element(),
                     toggle_row(
+                        "tg-show-hidden",
+                        "显示隐藏文件",
+                        "显示以“.”开头的文件和文件夹，例如 .git、.env。关闭后这些项目不会出现在文件列表、分栏视图、路径搜索或命令补全中。",
+                        p.show_hidden,
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut np = prefs();
+                            np.show_hidden = !np.show_hidden;
+                            apply_prefs(np, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+                    toggle_row(
                         "tg-filter-button",
-                        "Filter button",
-                        "Show the always-on \u{201c}Filter\u{201d} button in the bottom-right corner. Pressing / still opens the filter either way.",
+                        "筛选按钮",
+                        "在右下角始终显示“筛选”按钮。无论是否显示该按钮，都可以按 / 打开筛选。",
                         p.show_filter_button,
                         cx.listener(|_, _: &ClickEvent, _, cx| {
                             let mut np = prefs();
@@ -1450,8 +1605,8 @@ impl Settings {
                     .into_any_element(),
                     toggle_row(
                         "tg-terminal",
-                        "Terminal mode",
-                        "Show a command input at the bottom to move through the explorer like a terminal (with path/command autocomplete).",
+                        "终端模式",
+                        "在底部显示命令输入框，可像使用终端一样浏览文件，并支持路径和命令自动补全。",
                         p.terminal,
                         cx.listener(|_, _: &ClickEvent, _, cx| {
                             let mut np = prefs();
@@ -1463,8 +1618,8 @@ impl Settings {
                     .into_any_element(),
                     toggle_row(
                         "tg-term-history",
-                        "Terminal history",
-                        "Show a scrollback of what you've typed and command output above the input (otherwise it's just the input line).",
+                        "终端历史记录",
+                        "在输入框上方显示输入内容和命令输出的历史记录；关闭后只显示输入行。",
                         p.term_history,
                         cx.listener(|_, _: &ClickEvent, _, cx| {
                             let mut np = prefs();
@@ -1477,13 +1632,13 @@ impl Settings {
                 ],
             ),
             settings_section(
-                "Inspector",
-                Some("The side panel shown when you click a file."),
+                "检查器",
+                Some("单击文件时显示的侧面板。"),
                 vec![
                     toggle_row(
                         "tg-preview",
-                        "Preview",
-                        "Click a file once to preview it (images, PDFs, documents, \u{2026}) in the inspector panel.",
+                        "预览",
+                        "单击文件后在检查器中预览图像、PDF、文档等内容。",
                         p.preview,
                         cx.listener(|_, _: &ClickEvent, _, cx| {
                             let mut np = prefs();
@@ -1495,8 +1650,8 @@ impl Settings {
                     .into_any_element(),
                     toggle_row(
                         "tg-preview-pages",
-                        "Preview page controls",
-                        "Show \u{2039} \u{203a} arrows under multi-page PDF previews to flip through the pages without opening the file.",
+                        "预览翻页控件",
+                        "在多页 PDF 预览下方显示 ‹ › 箭头，无需打开文件即可翻页。",
                         p.preview_pages,
                         cx.listener(|_, _: &ClickEvent, _, cx| {
                             let mut np = prefs();
@@ -1508,8 +1663,8 @@ impl Settings {
                     .into_any_element(),
                     toggle_row(
                         "tg-info",
-                        "Information",
-                        "Click a file once to see its details (kind, size, dates, dimensions, color space, and more) in the inspector panel.",
+                        "文件信息",
+                        "单击文件后在检查器中显示类型、大小、日期、尺寸、色彩空间等详细信息。",
                         p.info,
                         cx.listener(|_, _: &ClickEvent, _, cx| {
                             let mut np = prefs();
@@ -1522,12 +1677,12 @@ impl Settings {
                 ],
             ),
             settings_section(
-                "Command Palette",
-                Some("The Cmd+P search and actions."),
+                "命令面板",
+                Some("Cmd+P 搜索与操作。"),
                 vec![toggle_row(
                     "tg-palette-history",
-                    "Command palette history",
-                    "Give Cmd+P its own query history: press Up/Down in the palette to cycle through your previous searches.",
+                    "命令面板历史记录",
+                    "为 Cmd+P 保存独立的查询历史；在命令面板中按上/下方向键可切换之前的搜索。",
                     p.palette_history,
                     cx.listener(|_, _: &ClickEvent, _, cx| {
                         let mut np = prefs();
@@ -1539,13 +1694,13 @@ impl Settings {
                 .into_any_element()],
             ),
             settings_section(
-                "Sidebar",
+                "侧边栏",
                 None,
                 vec![
                     toggle_row(
                         "tg-groups",
-                        "Sidebar groups",
-                        "Create custom groups of files/folders in the sidebar. Right-click the sidebar to make a group, then right-click any item to add it.",
+                        "侧边栏分组",
+                        "在侧边栏创建自定义文件或文件夹分组。右键单击侧边栏创建分组，再右键单击任意项目将其加入分组。",
                         p.groups_enabled,
                         cx.listener(|_, _: &ClickEvent, _, cx| {
                             let mut np = prefs();
@@ -1557,8 +1712,8 @@ impl Settings {
                     .into_any_element(),
                     toggle_row(
                         "tg-waterfall",
-                        "Waterfall folder tree",
-                        "Show an expandable tree of the current folder's subfolders at the bottom of the sidebar. Click a triangle to drill in, click a name to open it in the pane.",
+                        "瀑布式文件夹树",
+                        "在侧边栏底部显示当前文件夹的可展开子文件夹树。单击三角形展开，单击名称在面板中打开。",
                         p.waterfall,
                         cx.listener(|_, _: &ClickEvent, _, cx| {
                             let mut np = prefs();
@@ -1570,10 +1725,10 @@ impl Settings {
                     .into_any_element(),
                     stepper_row(
                         "st-recents",
-                        "Recent folders",
-                        "How many recently-visited folders to show in the sidebar (0 hides the Recents section).",
+                        "最近使用的文件夹",
+                        "设置侧边栏显示的最近访问文件夹数量；设为 0 时隐藏“最近使用”分区。",
                         if p.recent_limit == 0 {
-                            "Off".to_string()
+                            "关闭".to_string()
                         } else {
                             p.recent_limit.to_string()
                         },
@@ -1594,18 +1749,18 @@ impl Settings {
                 ],
             ),
             settings_section(
-                "Connections",
-                Some("SFTP servers — browse remote hosts over SSH from the sidebar."),
+                "连接",
+                Some("SFTP 服务器——从侧边栏通过 SSH 浏览远程主机。"),
                 connection_rows,
             ),
             settings_section(
-                "Script Actions",
-                Some("Run your own shell scripts from the right-click menu."),
+                "脚本操作",
+                Some("从右键菜单运行自己的 shell 脚本。"),
                 vec![
                     toggle_row(
                         "tg-script-actions",
-                        "Run script actions",
-                        "Show your own shell scripts (from the Scripts folder) in the right-click menu for matching files, and run them with the selected paths. Only scripts you put there run \u{2014} treat it like your ~/bin.",
+                        "启用脚本操作",
+                        "针对匹配的文件，在右键菜单中显示“脚本”文件夹里的 shell 脚本，并把所选路径传给脚本运行。只会运行你放入其中的脚本，请像管理 ~/bin 一样谨慎管理。",
                         p.script_actions,
                         cx.listener(|_, _: &ClickEvent, _, cx| {
                             let mut np = prefs();
@@ -1622,17 +1777,17 @@ impl Settings {
                 ],
             ),
             settings_section(
-                "Software Update",
+                "软件更新",
                 None,
                 vec![self.render_update_row(cx)],
             ),
             settings_section(
-                "Developer",
-                Some("Diagnostics for checking performance."),
+                "开发者",
+                Some("用于检查性能的诊断工具。"),
                 vec![toggle_row(
                     "tg-show-fps",
-                    "Frame rate meter",
-                    "Show a live FPS readout in the top-right of the explorer window. Forces continuous redraws to measure them, so it uses some CPU while on \u{2014} meant for checking smoothness, not everyday use.",
+                    "帧率显示",
+                    "在文件浏览器右上角实时显示 FPS。测量时会强制持续重绘并占用部分 CPU，仅用于检查流畅度，不建议日常开启。",
                     p.show_fps,
                     cx.listener(|_, _: &ClickEvent, _, cx| {
                         let mut np = prefs();
@@ -1647,7 +1802,7 @@ impl Settings {
                 .pt_1()
                 .child(reset_button(
                     "reset-general",
-                    "Reset General to Default",
+                    "恢复常规默认设置",
                     cx.listener(|_, _: &ClickEvent, _, cx| {
                         apply_prefs(Prefs::default(), cx);
                         cx.notify();
@@ -1664,17 +1819,17 @@ impl Settings {
         let state = cx.global::<UpdateCheckGlobal>().0.clone();
         let status: Option<String> = match &state {
             UpdateCheck::Idle => None,
-            UpdateCheck::Checking => Some("Checking\u{2026}".into()),
-            UpdateCheck::UpToDate => Some("You\u{2019}re up to date.".into()),
-            UpdateCheck::Available(v) => Some(format!("{v} is available.")),
-            UpdateCheck::Failed => Some("Couldn\u{2019}t reach GitHub \u{2014} try again.".into()),
-            UpdateCheck::Install(v) => Some(format!("Installing {v}\u{2026} the app will relaunch.")),
+            UpdateCheck::Checking => Some("正在检查…".into()),
+            UpdateCheck::UpToDate => Some("已是最新版本。".into()),
+            UpdateCheck::Available(v) => Some(format!("发现新版本 {v}。")),
+            UpdateCheck::Failed => Some("无法连接 GitHub，请重试。".into()),
+            UpdateCheck::Install(v) => Some(format!("正在安装 {v}…应用将重新启动。")),
         };
         let button: Option<&'static str> = match &state {
-            UpdateCheck::Idle => Some("Check for Updates"),
-            UpdateCheck::UpToDate => Some("Check Again"),
-            UpdateCheck::Failed => Some("Try Again"),
-            UpdateCheck::Available(_) => Some("Install & Relaunch"),
+            UpdateCheck::Idle => Some("检查更新"),
+            UpdateCheck::UpToDate => Some("再次检查"),
+            UpdateCheck::Failed => Some("重试"),
+            UpdateCheck::Available(_) => Some("安装并重新启动"),
             UpdateCheck::Checking | UpdateCheck::Install(_) => None,
         };
         let avail = matches!(state, UpdateCheck::Available(_));
@@ -1731,10 +1886,10 @@ impl Settings {
                     .child(
                         div()
                             .text_color(rgb(t.text))
-                            .child(format!("Version {}", env!("CARGO_PKG_VERSION"))),
+                            .child(format!("版本 {}", env!("CARGO_PKG_VERSION"))),
                     )
                     .child(div().text_xs().text_color(rgb(t.text_muted)).child(
-                        "Check GitHub for a newer release and install it in place \u{2014} the app swaps itself and relaunches.",
+                        "从 GitHub 检查新版本并就地安装；应用会替换自身并重新启动。",
                     )),
             )
             .child(right)
@@ -1750,11 +1905,11 @@ impl Settings {
             let binding = km.get(action);
             // The binding chip: shows the keystroke, "Unbound", or a recording hint.
             let (chip_text, chip_dim) = if recording {
-                ("Press keys… (⌫ clear, esc cancel)".to_string(), false)
+                ("请按快捷键…（⌫ 清除，Esc 取消）".to_string(), false)
             } else {
                 match binding {
                     Some(b) => (pretty_keystroke(b), false),
-                    None => ("Unbound".to_string(), true),
+                    None => ("未设置".to_string(), true),
                 }
             };
             rows.push(
@@ -1792,16 +1947,16 @@ impl Settings {
         }
         vec![
             settings_header(
-                "Keybinds",
-                "Click a shortcut, then press the keys. \u{232b} clears it; Esc cancels.",
+                "快捷键",
+                "单击某项后按下快捷键。⌫ 清除，Esc 取消。",
             )
             .into_any_element(),
-            settings_section("Shortcuts", None, rows),
+            settings_section("快捷键", None, rows),
             div()
                 .pt_1()
                 .child(reset_button(
                     "reset-keybinds",
-                    "Reset Shortcuts to Default",
+                    "恢复默认快捷键",
                     cx.listener(|this, _: &ClickEvent, _, cx| {
                         this.recording = None;
                         apply_keymap(Keymap::defaults(), cx);
@@ -1909,7 +2064,7 @@ impl Settings {
                 div()
                     .text_xs()
                     .text_color(rgb(t.text_muted))
-                    .child("Live preview of the right-click menu."),
+                    .child("右键菜单实时预览。"),
             )
             .into_any_element();
 
@@ -1928,7 +2083,7 @@ impl Settings {
                         div()
                             .text_xs()
                             .text_color(rgb(t.text_muted))
-                            .child("Pick a color below or upload an image (PNG or JPG; square looks best)."),
+                            .child("可在下方选择颜色或上传图片（PNG 或 JPG，正方形效果最佳）。"),
                     )
                     .child(
                         div()
@@ -1945,13 +2100,13 @@ impl Settings {
                                     .border_1()
                                     .border_color(rgb(t.border))
                                     .hover(|s| s.border_color(rgb(t.accent)))
-                                    .child("Upload Background\u{2026}")
+                                    .child("上传背景…")
                                     .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
                                         let rx = cx.prompt_for_paths(PathPromptOptions {
                                             files: true,
                                             directories: false,
                                             multiple: false,
-                                            prompt: Some("Choose Background Image".into()),
+                                            prompt: Some("选择背景图片".into()),
                                         });
                                         cx.spawn(async move |_, cx| {
                                             if let Ok(Ok(Some(paths))) = rx.await {
@@ -1976,7 +2131,7 @@ impl Settings {
                                     .cursor_pointer()
                                     .bg(rgb(t.hover))
                                     .hover(|s| s.bg(rgb(t.selected)))
-                                    .child("Reset")
+                                    .child("重置")
                                     .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
                                         apply_icon_bg(IconBg::Default, cx);
                                     })),
@@ -1994,8 +2149,8 @@ impl Settings {
                 div()
                     .text_color(rgb(t.text))
                     .child(match icon_pack() {
-                        Some(p) => format!("Current pack: {}", path_label(&p)),
-                        None => "Using macOS icons".to_string(),
+                        Some(p) => format!("当前图标包：{}", path_label(&p)),
+                        None => "正在使用 macOS 图标".to_string(),
                     }),
             )
             .child(
@@ -2013,13 +2168,13 @@ impl Settings {
                             .border_1()
                             .border_color(rgb(t.border))
                             .hover(|s| s.border_color(rgb(t.accent)))
-                            .child("Choose Folder\u{2026}")
+                            .child("选择文件夹…")
                             .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
                                 let rx = cx.prompt_for_paths(PathPromptOptions {
                                     files: false,
                                     directories: true,
                                     multiple: false,
-                                    prompt: Some("Choose Icon Pack".into()),
+                                    prompt: Some("选择图标包".into()),
                                 });
                                 cx.spawn(async move |this, cx| {
                                     if let Ok(Ok(Some(paths))) = rx.await {
@@ -2041,7 +2196,7 @@ impl Settings {
                             .cursor_pointer()
                             .bg(rgb(t.hover))
                             .hover(|s| s.bg(rgb(t.selected)))
-                            .child("Use macOS icons")
+                            .child("使用 macOS 图标")
                             .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
                                 apply_icon_pack(None, cx);
                             })),
@@ -2052,46 +2207,45 @@ impl Settings {
                     .text_xs()
                     .text_color(rgb(t.text_dim))
                     .child(
-                        "A folder of images named folder.png, file.png, and per-extension \
-                         (e.g. pdf.png, png.png). PNG with transparency works best.",
+                        "文件夹内可包含 folder.png、file.png 以及按扩展名命名的图像（如 pdf.png、png.png）。带透明背景的 PNG 效果最佳。",
                     ),
             )
             .into_any_element();
 
         vec![
             settings_header(
-                "Customization",
-                "Make Shuffle yours \u{2014} palette, menus, and app icon.",
+                "个性化",
+                "调整 Shuffle 的主题、菜单和应用图标。",
             )
             .into_any_element(),
             settings_section(
-                "Theme",
-                Some("Pick a starting palette, then fine-tune the colors below."),
+                "主题",
+                Some("先选择一个预设主题，再在下方微调颜色。"),
                 vec![presets_grid],
             ),
             settings_section(
-                "Colors",
-                Some("Core interface colors. Type a hex value or pick from the swatches."),
+                "颜色",
+                Some("核心界面颜色。可输入十六进制色值或从色板中选择。"),
                 vec![
                     color_block(
-                        "Background",
-                        "The main window and file list.",
+                        "背景",
+                        "主窗口和文件列表的背景颜色。",
                         ColorTarget::Bg,
                         t.bg,
                         self.color_row("bg", t.bg, |t, c| t.bg = c, cx).into_any_element(),
                         self.hex_field(ColorTarget::Bg, t.bg, cx).into_any_element(),
                     ),
                     color_block(
-                        "Text",
-                        "Primary text throughout the app.",
+                        "文字",
+                        "应用中的主要文字颜色。",
                         ColorTarget::Text,
                         t.text,
                         self.color_row("text", t.text, |t, c| t.text = c, cx).into_any_element(),
                         self.hex_field(ColorTarget::Text, t.text, cx).into_any_element(),
                     ),
                     color_block(
-                        "Mouseover",
-                        "The highlight behind hovered rows and buttons.",
+                        "悬停",
+                        "鼠标悬停在行和按钮上时的高亮颜色。",
                         ColorTarget::Hover,
                         t.hover,
                         self.color_row("hover", t.hover, |t, c| t.hover = c, cx).into_any_element(),
@@ -2100,13 +2254,13 @@ impl Settings {
                 ],
             ),
             settings_section(
-                "Menu",
-                Some("The right-click / dropdown menu appearance."),
+                "菜单",
+                Some("右键菜单和下拉菜单的外观。"),
                 vec![
                     menu_preview_row,
                     color_block(
-                        "Menu color",
-                        "The menu background.",
+                        "菜单背景",
+                        "菜单的背景颜色。",
                         ColorTarget::MenuBg,
                         menu_style().bg,
                         self.menu_color_row("menubg", menu_style().bg, |m, c| m.bg = c, cx)
@@ -2114,8 +2268,8 @@ impl Settings {
                         self.hex_field(ColorTarget::MenuBg, menu_style().bg, cx).into_any_element(),
                     ),
                     color_block(
-                        "Letter color",
-                        "The menu text.",
+                        "菜单文字",
+                        "菜单的文字颜色。",
                         ColorTarget::MenuText,
                         menu_style().text,
                         self.menu_color_row("menutext", menu_style().text, |m, c| m.text = c, cx)
@@ -2125,8 +2279,8 @@ impl Settings {
                     ),
                     stepper_row(
                         "st-menu-opacity",
-                        "Opacity",
-                        "Menu background opacity (lower is more see-through).",
+                        "不透明度",
+                        "菜单背景的不透明度；数值越低越透明。",
                         format!("{}%", menu_style().opacity),
                         cx.listener(|_, _: &ClickEvent, _, cx| {
                             let mut m = menu_style();
@@ -2144,8 +2298,8 @@ impl Settings {
                     .into_any_element(),
                     stepper_row(
                         "st-menu-size",
-                        "Text size",
-                        "Menu font size in pixels.",
+                        "文字大小",
+                        "菜单字体大小（像素）。",
                         format!("{}px", menu_style().font_px as i32),
                         cx.listener(|_, _: &ClickEvent, _, cx| {
                             let mut m = menu_style();
@@ -2164,20 +2318,20 @@ impl Settings {
                 ],
             ),
             settings_section(
-                "App Icon",
-                Some("The Dock and Finder icon."),
+                "应用图标",
+                Some("Dock 和访达中显示的图标。"),
                 vec![app_icon_row, self.icon_color_row(cx).into_any_element()],
             ),
             settings_section(
-                "Icon Pack",
-                Some("Replace macOS file icons with your own image set."),
+                "图标包",
+                Some("使用自定义图像替换 macOS 文件图标。"),
                 vec![icon_pack_row],
             ),
             div()
                 .pt_1()
                 .child(reset_button(
                     "reset-customization",
-                    "Reset Customization to Default",
+                    "恢复个性化默认设置",
                     cx.listener(|_, _: &ClickEvent, _, cx| {
                         apply_theme(Theme::default(), cx);
                         apply_menu_style(MenuStyle::default(), cx);
@@ -2284,11 +2438,11 @@ impl Settings {
             .border_1()
             .border_color(rgb(t.border_strong))
             .shadow_lg()
-            .child(row("Open"))
-            .child(row("Rename"))
-            .child(row("Add to Bookmarks"))
+            .child(row("打开"))
+            .child(row("重命名"))
+            .child(row("添加到书签"))
             .child(div().my_1().mx_2().h(px(1.0)).bg(rgb(t.border_strong)))
-            .child(row("Move to Trash"))
+            .child(row("移到废纸篓"))
     }
 
     /// A live preview of the app icon (the recolored base — matches the Dock).
@@ -2668,6 +2822,9 @@ fn stepper_row(
 
 // Default column widths for the main listing; all are user-resizable.
 const ICON_W: f32 = 18.0;
+/// Horizontal space inside the Name cell besides the icon itself: `gap_2`
+/// between icon/text plus `pr_2` before the Kind column (8 px each).
+const NAME_LABEL_INSET: f32 = 16.0;
 const MIN_COL_W: f32 = 50.0;
 
 // Command-palette result row height, and how many show before scrolling.
@@ -2697,6 +2854,55 @@ const RENAME_ERR_COLOR: u32 = 0xef4444;
 /// active", and the file-drop highlight must not appear during tab drags).
 /// Set by the chip's drag constructor; cleared on drop or when the drag ends.
 static TAB_DRAG_LIVE: AtomicBool = AtomicBool::new(false);
+
+/// True only while Shuffle itself is the source of a native file drag. GPUI
+/// exposes every native drop as `ExternalPaths`, so this distinguishes an
+/// internal drag (move) from WeChat/Finder/another app (copy).
+static SHUFFLE_FILE_DRAG_LIVE: AtomicBool = AtomicBool::new(false);
+
+/// A retained URL read from the live drag pasteboard. Some source apps grant
+/// access by attaching a sandbox extension to the URL even when
+/// `startAccessingSecurityScopedResource` returns false, so the URL must remain
+/// retained independently of that return value.
+struct ExternalDropUrl {
+    url: objc2::rc::Retained<NSURL>,
+    security_scope_started: bool,
+}
+
+impl Drop for ExternalDropUrl {
+    fn drop(&mut self) {
+        if self.security_scope_started {
+            unsafe { self.url.stopAccessingSecurityScopedResource() };
+        }
+    }
+}
+
+thread_local! {
+    /// Exact NSURL objects supplied by the current NSDraggingInfo. GPUI 0.2.2
+    /// reduces these to path strings before dispatching the drop, which loses
+    /// the sandbox extension attached by apps such as WeChat. The native
+    /// performDragOperation: bridge below keeps the original objects and their
+    /// access grants alive while GPUI synchronously invokes Shuffle's handler.
+    static ACTIVE_NATIVE_DROP_URLS: RefCell<Vec<ExternalDropUrl>> = RefCell::new(Vec::new());
+    /// File promises offered by the current source application. These take
+    /// priority over file URLs: the source writes a fresh copy into a receiver
+    /// supplied directory, so Shuffle never has to open the source app's
+    /// protected container.
+    static ACTIVE_NATIVE_FILE_PROMISES: RefCell<Vec<objc2::rc::Retained<NSFilePromiseReceiver>>> = RefCell::new(Vec::new());
+    /// Legacy `NSFilesPromisePboardType` sources (WeChat 4.x uses this Carbon
+    /// promise protocol) must be resolved through `NSDraggingInfo` itself.
+    static ACTIVE_NATIVE_LEGACY_PROMISE: RefCell<Option<LegacyFilePromise>> = RefCell::new(None);
+}
+
+#[derive(Clone)]
+struct LegacyFilePromise {
+    dragging_info: objc2::rc::Retained<AnyObject>,
+}
+
+type NativePerformDrop =
+    unsafe extern "C-unwind" fn(*mut AnyObject, Sel, *mut AnyObject) -> Bool;
+
+static ORIGINAL_NATIVE_PERFORM_DROP: OnceLock<NativePerformDrop> = OnceLock::new();
 
 /// The four resizable columns of the main listing.
 #[derive(Clone, Copy, PartialEq)]
@@ -2831,11 +3037,31 @@ struct Rename {
     anchor: Option<usize>,
 }
 
+/// The editable surface currently owning macOS text input. The existing UI
+/// keeps all text fields in the root `Shuffle` entity, so the IME adapter maps
+/// platform callbacks onto these small, cursor-aware buffers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImeTarget {
+    Rename,
+    ServerQuick,
+    ServerName,
+    ServerHost,
+    ServerUser,
+    ServerPort,
+    ServerPassword,
+    Palette,
+    Path(usize),
+    Find(usize),
+    Terminal,
+    Group,
+}
+
 /// The current level shown in the context menu.
 #[derive(Clone, Copy, PartialEq)]
 enum MenuView {
     Root,
     OpenWith,
+    Terminal,
     Tags,
     QuickActions,
     Services,
@@ -2873,6 +3099,43 @@ struct PaletteItem {
     is_dir: bool,
 }
 
+/// Where the command-palette file search runs. The current-folder scope is
+/// recursive (Finder-style), while global keeps the existing ~/ index scope.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaletteSearchScope {
+    Current,
+    Global,
+}
+
+impl PaletteSearchScope {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Current => "当前目录",
+            Self::Global => "全局",
+        }
+    }
+}
+
+/// How command-palette file results are ordered. Relevance preserves the
+/// fuzzy rank; type is alphabetical by the displayed Kind; time is newest
+/// modified first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaletteSearchSort {
+    Relevance,
+    Kind,
+    Modified,
+}
+
+impl PaletteSearchSort {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Relevance => "相关度",
+            Self::Kind => "类型",
+            Self::Modified => "时间",
+        }
+    }
+}
+
 /// One row in the main listing, with the metadata we display.
 #[derive(Clone)]
 struct Entry {
@@ -2899,12 +3162,12 @@ enum SortKey {
 impl SortKey {
     fn label(self) -> &'static str {
         match self {
-            SortKey::None => "None",
-            SortKey::Name => "Name",
-            SortKey::Kind => "Kind",
-            SortKey::Modified => "Date Modified",
-            SortKey::Created => "Date Created",
-            SortKey::Size => "Size",
+            SortKey::None => "默认",
+            SortKey::Name => "名称",
+            SortKey::Kind => "种类",
+            SortKey::Modified => "修改日期",
+            SortKey::Created => "创建日期",
+            SortKey::Size => "大小",
         }
     }
 }
@@ -2923,6 +3186,9 @@ enum ViewMode {
 struct Tab {
     current_dir: PathBuf,
     entries: Vec<Entry>,
+    /// Hidden-file preference used to build `entries`; inactive tabs compare
+    /// this when selected so even an empty hidden-only folder reloads.
+    loaded_show_hidden: bool,
     /// Back/forward navigation history and our position within it.
     history: Vec<PathBuf>,
     hist_pos: usize,
@@ -2959,8 +3225,12 @@ struct Tab {
     h_scroll: ScrollHandle,
     /// The set of selected items.
     selection: HashSet<PathBuf>,
-    /// The focused item (last clicked): used for shift-range and the inspector.
+    /// The focused item (last clicked): used by the inspector and item actions.
     anchor: Option<PathBuf>,
+    /// Stable starting item for Shift-click range selection. This is separate
+    /// from `anchor` because the inspector follows the most recently clicked
+    /// item while repeated Shift-clicks must keep extending from one origin.
+    selection_anchor: Option<PathBuf>,
     /// Sort criterion and direction for this tab's listing.
     sort_key: SortKey,
     sort_asc: bool,
@@ -2988,10 +3258,11 @@ struct Tab {
 impl Tab {
     fn new(dir: PathBuf) -> Self {
         // Fast first paint; full metadata is filled in from the background.
-        let entries = read_entries_fast(&dir);
+        let entries = read_entries_fast(&dir, prefs().show_hidden);
         Tab {
             current_dir: dir.clone(),
             entries,
+            loaded_show_hidden: prefs().show_hidden,
             history: vec![dir.clone()],
             hist_pos: 0,
             deepest: Some(dir),
@@ -3009,6 +3280,7 @@ impl Tab {
             h_scroll: ScrollHandle::new(),
             selection: HashSet::new(),
             anchor: None,
+            selection_anchor: None,
             sort_key: SortKey::None,
             sort_asc: true,
             view: ViewMode::List,
@@ -3102,6 +3374,10 @@ impl Render for TabDragPreview {
 struct Shuffle {
     panes: Vec<Pane>,
     active_pane: usize,
+    /// Last hidden-file preference applied to the loaded tab data. Kept here
+    /// because `apply_prefs` updates the render-side global before observers
+    /// run, so comparing two global reads cannot detect the transition.
+    show_hidden: bool,
     /// Left pane's width fraction when two panes are shown (0.2..0.8).
     split_ratio: f32,
     /// In-progress divider drag: (cursor x at grab, split_ratio at grab).
@@ -3130,6 +3406,9 @@ struct Shuffle {
     scroll_drag: Option<ScrollDrag>,
     // Command palette (Cmd+P).
     focus: FocusHandle,
+    /// The marked (pre-edit) range managed by the active macOS input method.
+    /// Byte offsets are used internally; GPUI translates to UTF-16 at its API.
+    ime_marked: Option<(ImeTarget, Range<usize>)>,
     palette_open: bool,
     query: String,
     /// Text-cursor position in `query`, as a char index (0..=char count).
@@ -3143,6 +3422,9 @@ struct Shuffle {
     /// Which history entry is being browsed with Up/Down (None = live query).
     palette_hist_pos: Option<usize>,
     palette_items: Vec<PaletteItem>,
+    /// Search controls shown in the Cmd+P palette.
+    palette_search_scope: PaletteSearchScope,
+    palette_search_sort: PaletteSearchSort,
     selected: usize,
     /// The palette's ⌘K actions panel: selected action index (None = closed).
     palette_actions: Option<usize>,
@@ -3151,6 +3433,8 @@ struct Shuffle {
     /// In-memory fuzzy index of ~/ (None until the background build finishes).
     index: Option<Arc<FileIndex>>,
     context_menu: Option<ContextMenu>,
+    /// Finder-style Quick Look process launched by the Space shortcut.
+    quick_look: Option<std::process::Child>,
     /// In-progress inline rename, if any.
     rename: Option<Rename>,
     /// Open "Sort By" dropdown: (pane, x, y) in window coords.
@@ -3243,10 +3527,34 @@ impl Shuffle {
             cx.notify();
         })
         .detach();
-        // Sync + repaint whenever feature prefs change.
-        cx.observe_global::<PrefsGlobal>(|_, cx| {
-            set_active_prefs(cx.global::<PrefsGlobal>().0);
-            cx.notify();
+        // Sync + repaint whenever feature prefs change. A hidden-file change
+        // affects the data set itself, so rebuild every tab rather than only
+        // repainting stale entries loaded under the old preference.
+        cx.observe_global::<PrefsGlobal>(|this, cx| {
+            let next = cx.global::<PrefsGlobal>().0;
+            let hidden_changed = this.show_hidden != next.show_hidden;
+            this.show_hidden = next.show_hidden;
+            set_active_prefs(next);
+            if hidden_changed {
+                this.context_menu = None;
+                this.rename = None;
+                this.hovered = None;
+                this.waterfall_children.clear();
+                this.waterfall_pending.clear();
+                this.waterfall_mtime.clear();
+                clear_column_cache();
+
+                for pane in &mut this.panes {
+                    for tab in &mut pane.tabs {
+                        tab.selection.clear();
+                        tab.selection_anchor = None;
+                        tab.anchor = None;
+                    }
+                }
+                this.refresh_all_panes(cx);
+            } else {
+                cx.notify();
+            }
         })
         .detach();
         // Sync + repaint whenever the saved SFTP servers change (from Settings).
@@ -3357,6 +3665,7 @@ impl Shuffle {
         Self {
             panes: vec![Pane::new(dir)],
             active_pane: 0,
+            show_hidden: prefs().show_hidden,
             split_ratio: 0.5,
             divider_drag: None,
             split_epoch: 0,
@@ -3372,6 +3681,7 @@ impl Shuffle {
             resize: None,
             scroll_drag: None,
             focus: cx.focus_handle(),
+            ime_marked: None,
             palette_open: false,
             query: String::new(),
             query_cursor: 0,
@@ -3379,12 +3689,15 @@ impl Shuffle {
             palette_hist: read_string_list("palette_history.txt"),
             palette_hist_pos: None,
             palette_items: Vec::new(),
+            palette_search_scope: PaletteSearchScope::Global,
+            palette_search_sort: PaletteSearchSort::Relevance,
             selected: 0,
             palette_actions: None,
             search_gen: 0,
             palette_scroll: ScrollHandle::new(),
             index: None,
             context_menu: None,
+            quick_look: None,
             rename: None,
             sort_menu: None,
             confirm_delete: None,
@@ -3432,6 +3745,278 @@ impl Shuffle {
         self.tab(self.active_pane)
     }
 
+    // ----- macOS text input / IME ------------------------------------------
+
+    /// Mirrors the priority order in `on_key`: whichever modal editor handles
+    /// keyboard input also receives committed and marked text from the IME.
+    fn ime_target(&self) -> Option<ImeTarget> {
+        if self.ssh_ask || self.confirm_delete.is_some() {
+            return None;
+        }
+        if let Some(form) = &self.server_dialog {
+            return Some(match form.mode {
+                ServerMode::Quick => ImeTarget::ServerQuick,
+                ServerMode::Credentials => match form.field {
+                    CredField::Name => ImeTarget::ServerName,
+                    CredField::Host => ImeTarget::ServerHost,
+                    CredField::User => ImeTarget::ServerUser,
+                    CredField::Port => ImeTarget::ServerPort,
+                    CredField::Password => ImeTarget::ServerPassword,
+                },
+            });
+        }
+        if self.group_dialog.is_some() {
+            return Some(ImeTarget::Group);
+        }
+        if self.rename.is_some() {
+            return Some(ImeTarget::Rename);
+        }
+        if self.active_tab().editing_path.is_some() {
+            return Some(ImeTarget::Path(self.active_pane));
+        }
+        if self.active_tab().find_query.is_some() {
+            return Some(ImeTarget::Find(self.active_pane));
+        }
+        if self.term_focused && prefs().terminal {
+            return Some(ImeTarget::Terminal);
+        }
+        self.palette_open.then_some(ImeTarget::Palette)
+    }
+
+    /// Paint-phase anchor for one concrete editable field. macOS asks this
+    /// element for a composition rectangle, so it must be a child of the field
+    /// rather than a full-window overlay; otherwise the candidate window lands
+    /// at the window's bottom-left corner.
+    fn ime_anchor(&self, target: ImeTarget, cx: &Context<Self>) -> Option<AnyElement> {
+        (self.ime_target() == Some(target)).then(|| {
+            let ime_focus = self.focus.clone();
+            let ime_view = cx.entity();
+            canvas(
+                |_bounds, _window, _cx| (),
+                move |bounds, _, window, cx| {
+                    window.handle_input(
+                        &ime_focus,
+                        ElementInputHandler::new(bounds, ime_view),
+                        cx,
+                    );
+                },
+            )
+            .absolute()
+            .size_full()
+            .into_any_element()
+        })
+    }
+
+    fn ime_text(&self, target: ImeTarget) -> Option<&str> {
+        match target {
+            ImeTarget::Rename => self.rename.as_ref().map(|rename| rename.text.as_str()),
+            ImeTarget::ServerQuick
+            | ImeTarget::ServerName
+            | ImeTarget::ServerHost
+            | ImeTarget::ServerUser
+            | ImeTarget::ServerPort
+            | ImeTarget::ServerPassword => self.server_dialog.as_ref().map(|form| match target {
+                ImeTarget::ServerQuick => form.addr.as_str(),
+                ImeTarget::ServerName => form.name.as_str(),
+                ImeTarget::ServerHost => form.host.as_str(),
+                ImeTarget::ServerUser => form.user.as_str(),
+                ImeTarget::ServerPort => form.port.as_str(),
+                ImeTarget::ServerPassword => form.password.as_str(),
+                _ => unreachable!(),
+            }),
+            ImeTarget::Palette => self.palette_open.then_some(self.query.as_str()),
+            ImeTarget::Path(pane) => self
+                .panes
+                .get(pane)
+                .and_then(|pane| pane.active_tab().editing_path.as_deref()),
+            ImeTarget::Find(pane) => self
+                .panes
+                .get(pane)
+                .and_then(|pane| pane.active_tab().find_query.as_deref()),
+            ImeTarget::Terminal => (self.term_focused && prefs().terminal).then_some(self.term_input.as_str()),
+            ImeTarget::Group => self.group_dialog.as_deref(),
+        }
+    }
+
+    /// Current text selection as UTF-8 byte offsets, plus its direction.
+    fn ime_selection(&self, target: ImeTarget) -> Option<(Range<usize>, bool)> {
+        let text = self.ime_text(target)?;
+        let (cursor, anchor) = match target {
+            ImeTarget::Rename => {
+                let rename = self.rename.as_ref()?;
+                (rename.cursor, rename.anchor)
+            }
+            ImeTarget::Palette => (self.query_cursor, self.query_anchor),
+            ImeTarget::Path(pane) => {
+                let tab = self.panes.get(pane)?.active_tab();
+                (tab.path_cursor, tab.path_anchor)
+            }
+            ImeTarget::Find(pane) => {
+                let tab = self.panes.get(pane)?.active_tab();
+                (tab.find_cursor, tab.find_anchor)
+            }
+            _ => (text.chars().count(), None),
+        };
+        let anchor = anchor.unwrap_or(cursor);
+        let start = char_byte(text, cursor.min(anchor));
+        let end = char_byte(text, cursor.max(anchor));
+        Some((start..end, anchor > cursor))
+    }
+
+    /// Replace a target's text and reflect a byte-range selection back into the
+    /// cursor representation that pre-dates the IME adapter.
+    fn ime_set_text_and_selection(&mut self, target: ImeTarget, text: String, selection: Range<usize>) {
+        if self.ime_target() != Some(target) {
+            return;
+        }
+        let selection_start = byte_char(&text, selection.start);
+        let selection_end = byte_char(&text, selection.end);
+        match target {
+            ImeTarget::Rename => {
+                if let Some(rename) = self.rename.as_mut() {
+                    rename.text = text;
+                    rename.cursor = selection_end;
+                    rename.anchor = (selection_start != selection_end).then_some(selection_start);
+                }
+            }
+            ImeTarget::ServerQuick
+            | ImeTarget::ServerName
+            | ImeTarget::ServerHost
+            | ImeTarget::ServerUser
+            | ImeTarget::ServerPort
+            | ImeTarget::ServerPassword => {
+                if let Some(form) = self.server_dialog.as_mut() {
+                    *form.active_field() = text;
+                }
+            }
+            ImeTarget::Palette => {
+                self.query = text;
+                self.query_cursor = selection_end;
+                self.query_anchor = (selection_start != selection_end).then_some(selection_start);
+                self.palette_hist_pos = None;
+            }
+            ImeTarget::Path(pane) => {
+                if let Some(tab) = self.panes.get_mut(pane).map(Pane::active_tab_mut) {
+                    tab.editing_path = Some(text);
+                    tab.path_cursor = selection_end;
+                    tab.path_anchor = (selection_start != selection_end).then_some(selection_start);
+                }
+            }
+            ImeTarget::Find(pane) => {
+                if let Some(tab) = self.panes.get_mut(pane).map(Pane::active_tab_mut) {
+                    tab.find_query = Some(text);
+                    tab.find_cursor = selection_end;
+                    tab.find_anchor = (selection_start != selection_end).then_some(selection_start);
+                }
+            }
+            ImeTarget::Terminal => self.term_input = text,
+            ImeTarget::Group => self.group_dialog = Some(text),
+        }
+    }
+
+    fn ime_text_changed(&mut self, target: ImeTarget, cx: &mut Context<Self>) {
+        match target {
+            ImeTarget::Palette => self.refresh_palette(cx),
+            ImeTarget::Find(pane) => {
+                self.recompute_find(pane);
+                self.update_content_search(pane, cx);
+            }
+            _ => cx.notify(),
+        }
+    }
+
+    fn ime_replace(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        selected_utf16: Option<Range<usize>>,
+        mark_text: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.ime_target() else { return };
+        let Some(mut current) = self.ime_text(target).map(str::to_owned) else { return };
+        let Some((selection, _)) = self.ime_selection(target) else { return };
+        let replacement = range_utf16
+            .map(|range| utf16_range_bytes(&current, range))
+            .or_else(|| {
+                self.ime_marked
+                    .as_ref()
+                    .filter(|(marked_target, _)| *marked_target == target)
+                    .map(|(_, range)| range.clone())
+            })
+            .unwrap_or(selection);
+        current.replace_range(replacement.clone(), text);
+
+        let selected = selected_utf16
+            .map(|range| {
+                let start = replacement.start + utf16_byte(text, range.start);
+                let end = replacement.start + utf16_byte(text, range.end).max(start - replacement.start);
+                start..end
+            })
+            .unwrap_or_else(|| {
+                let end = replacement.start + text.len();
+                end..end
+            });
+        self.ime_set_text_and_selection(target, current, selected);
+        self.ime_marked = (mark_text && !text.is_empty())
+            .then_some((target, replacement.start..replacement.start + text.len()));
+        self.ime_text_changed(target, cx);
+    }
+
+    // ----- Finder-style Quick Look ----------------------------------------
+
+    /// Close the Quick Look panel if Shuffle launched one and it is still
+    /// running. Returns true when an active preview was closed.
+    fn close_quick_look(&mut self) -> bool {
+        let Some(mut child) = self.quick_look.take() else {
+            return false;
+        };
+        match child.try_wait() {
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Toggle a native macOS Quick Look panel for the active selection. Multiple
+    /// selected files are passed together so the panel can move between them.
+    fn toggle_quick_look(&mut self, pane: usize, cx: &mut Context<Self>) {
+        if self.close_quick_look() {
+            cx.notify();
+            return;
+        }
+        let tab = self.tab(pane);
+        if tab.remote.is_some() {
+            return;
+        }
+        let mut paths: Vec<PathBuf> = tab
+            .selection
+            .iter()
+            .filter(|path| path.exists())
+            .cloned()
+            .collect();
+        if paths.is_empty() {
+            if let Some(path) = tab.anchor.clone().filter(|path| path.exists()) {
+                paths.push(path);
+            }
+        }
+        if paths.is_empty() {
+            return;
+        }
+        paths.sort();
+        self.quick_look = Command::new("/usr/bin/qlmanage")
+            .arg("-p")
+            .args(paths)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok();
+        cx.notify();
+    }
+
     // ----- right-click context menu -----
 
     fn open_context_menu(&mut self, pane: usize, x: f32, y: f32, target: Option<(PathBuf, bool)>, cx: &mut Context<Self>) {
@@ -3448,10 +4033,18 @@ impl Shuffle {
     }
 
     /// Switch the open context menu to a different level (keeps it open).
+    fn menu_view_is(&self, view: MenuView) -> bool {
+        self.context_menu
+            .as_ref()
+            .is_some_and(|menu| menu.view == view)
+    }
+
     fn set_menu_view(&mut self, view: MenuView, cx: &mut Context<Self>) {
         if let Some(menu) = self.context_menu.as_mut() {
-            menu.view = view;
-            cx.notify();
+            if menu.view != view {
+                menu.view = view;
+                cx.notify();
+            }
         }
     }
 
@@ -3480,7 +4073,9 @@ impl Shuffle {
         // Stamp the mtime *before* reading so a change racing the read bumps
         // it again and the watcher catches it on the next tick.
         self.tab_mut(pane).dir_mtime = fs::metadata(&dir).ok().and_then(|m| m.modified().ok());
-        self.tab_mut(pane).entries = read_entries_fast(&dir);
+        let show_hidden = prefs().show_hidden;
+        self.tab_mut(pane).loaded_show_hidden = show_hidden;
+        self.tab_mut(pane).entries = read_entries_fast(&dir, show_hidden);
         self.next_load_gen += 1;
         let gen = self.next_load_gen;
         self.tab_mut(pane).load_gen = gen;
@@ -3494,7 +4089,9 @@ impl Shuffle {
         // Fill full metadata in the background, then swap it in if still current.
         cx.spawn(async move |this, cx| {
             let d = dir.clone();
-            let full = cx.background_spawn(async move { read_entries(&d) }).await;
+            let full = cx
+                .background_spawn(async move { read_entries(&d, show_hidden) })
+                .await;
             let _ = this.update(cx, |this, cx| {
                 if pane < this.panes.len()
                     && this.tab(pane).load_gen == gen
@@ -3528,11 +4125,13 @@ impl Shuffle {
         self.tab_mut(pane).entries.clear();
         cx.notify();
         let use_system = prefs().ssh_use_system;
+        let show_hidden = prefs().show_hidden;
+        self.tab_mut(pane).loaded_show_hidden = show_hidden;
         cx.spawn(async move |this, cx| {
             let s = server.clone();
             let p = path.clone();
             let result = cx
-                .background_spawn(async move { sftp_list(&s, &p, use_system) })
+                .background_spawn(async move { sftp_list(&s, &p, use_system, show_hidden) })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 if pane >= this.panes.len()
@@ -3634,7 +4233,8 @@ impl Shuffle {
                     Ok(()) => {
                         this.remote_error = None;
                         this.tab_mut(pane).selection = std::iter::once(path.clone()).collect();
-                        this.tab_mut(pane).anchor = Some(path);
+                        this.tab_mut(pane).anchor = Some(path.clone());
+                        this.tab_mut(pane).selection_anchor = Some(path);
                         this.reload_pane(pane, cx);
                     }
                     Err(e) => {
@@ -3758,6 +4358,7 @@ impl Shuffle {
             self.mark_scrolled(pane, cx);
         }
         self.tab_mut(pane).selection = std::iter::once(path.clone()).collect();
+        self.tab_mut(pane).selection_anchor = Some(path.clone());
         self.focus_entry(pane, path, cx);
     }
 
@@ -3839,12 +4440,6 @@ impl Shuffle {
         .detach();
     }
 
-    fn move_to_trash(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
-        if trash_path(&path) {
-            self.refresh_pane(pane, cx);
-        }
-    }
-
     /// Ask to move the current selection (or the focused item) to Trash.
     fn request_delete(&mut self, pane: usize, cx: &mut Context<Self>) {
         let mut paths: Vec<PathBuf> = self.tab(pane).selection.iter().cloned().collect();
@@ -3861,6 +4456,19 @@ impl Shuffle {
         cx.notify();
     }
 
+    /// Delete the whole selection when the context-menu target belongs to it;
+    /// otherwise act on only the right-clicked item.
+    fn request_delete_target(&mut self, pane: usize, target: PathBuf, cx: &mut Context<Self>) {
+        if !self.tab(pane).selection.contains(&target) {
+            let tab = self.tab_mut(pane);
+            tab.selection.clear();
+            tab.selection.insert(target.clone());
+            tab.selection_anchor = Some(target.clone());
+            tab.anchor = Some(target);
+        }
+        self.request_delete(pane, cx);
+    }
+
     /// Carry out a confirmed delete: Trash locally, or permanently remove on a
     /// remote server (no Trash exists there).
     fn perform_delete(&mut self, cx: &mut Context<Self>) {
@@ -3869,6 +4477,7 @@ impl Shuffle {
                 let tab = self.tab_mut(pane);
                 tab.selection.clear();
                 tab.anchor = None;
+                tab.selection_anchor = None;
             }
             if let Some(server) = self.tab(pane).remote.clone() {
                 let use_system = prefs().ssh_use_system;
@@ -3902,41 +4511,257 @@ impl Shuffle {
         }
     }
 
-    /// Move `src` into `dest_dir` (a drag-and-drop between folders/panes). No-op
-    /// if it's already there; refuses to overwrite an existing item.
-    fn move_into(&mut self, dest_dir: PathBuf, src: PathBuf, cx: &mut Context<Self>) {
-        if !dest_dir.is_dir() {
+    /// Ask the source application to materialize its promised files in a
+    /// Shuffle-owned staging directory. This is the supported AppKit path for
+    /// drags from apps such as WeChat, Photos, and Safari: opening the legacy
+    /// filename exposed by those apps directly can instead hit macOS App Data
+    /// protection on the source application's container.
+    fn receive_file_promises(
+        &mut self,
+        dest_dir: PathBuf,
+        promises: Vec<objc2::rc::Retained<NSFilePromiseReceiver>>,
+        cx: &mut Context<Self>,
+    ) {
+        let staging = std::env::temp_dir().join(format!(
+            "shuffle-file-promises-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        if let Err(error) = fs::create_dir_all(&staging) {
+            self.remote_error = Some(format!("接收拖入文件失败：无法创建临时目录：{error}"));
+            cx.notify();
             return;
         }
-        let Some(name) = src.file_name() else { return };
-        // Already in this folder, or dropping a folder onto itself → ignore.
-        if src.parent() == Some(dest_dir.as_path()) || dest_dir == src {
+
+        let staging_url =
+            NSURL::fileURLWithPath(&NSString::from_str(&staging.to_string_lossy()));
+        let options = NSDictionary::<AnyObject, AnyObject>::new();
+        let queue = NSOperationQueue::new();
+        queue.setMaxConcurrentOperationCount(1);
+        let callback_errors = Arc::new(Mutex::new(Vec::<String>::new()));
+        let delivered = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
+        let expected_files = promises
+            .iter()
+            .map(|promise| promise.fileNames().count().max(1))
+            .sum();
+
+        // NSFilePromiseReceiver supports both modern item-based promises and
+        // the legacy NSFilesPromisePboardType used by WeChat.
+        for promise in promises {
+            let promise_errors = callback_errors.clone();
+            let promise_delivered = delivered.clone();
+            let reader: block2::RcBlock<dyn Fn(NonNull<NSURL>, *mut NSError)> =
+                block2::RcBlock::new(move |url: NonNull<NSURL>, error: *mut NSError| {
+                    if let Some(error) = unsafe { error.as_ref() } {
+                        if let Ok(mut errors) = promise_errors.lock() {
+                            errors.push(single_line_name(
+                                &error.localizedDescription().to_string(),
+                            ));
+                        }
+                        return;
+                    }
+                    let url = unsafe { url.as_ref() };
+                    if let Some(path) = url.path() {
+                        if let Ok(mut paths) = promise_delivered.lock() {
+                            paths.push(PathBuf::from(path.to_string()));
+                        }
+                    }
+                });
+            unsafe {
+                promise.receivePromisedFilesAtDestination_options_operationQueue_reader(
+                    &staging_url,
+                    &options,
+                    &queue,
+                    &reader,
+                );
+            }
+        }
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    queue.waitUntilAllOperationsAreFinished();
+                    finish_file_promise_drop(
+                        &staging,
+                        &dest_dir,
+                        &delivered,
+                        &callback_errors,
+                        expected_files,
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.remote_error = result.err();
+                this.refresh_all_panes(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Resolve WeChat's Carbon-era `NSFilesPromisePboardType` while the real
+    /// NSDraggingInfo is still valid. The source app writes into a Shuffle
+    /// staging directory, after which we copy into the user's target folder.
+    fn receive_legacy_file_promise(
+        &mut self,
+        dest_dir: PathBuf,
+        promise: LegacyFilePromise,
+        cx: &mut Context<Self>,
+    ) {
+        let staging = std::env::temp_dir().join(format!(
+            "shuffle-legacy-file-promise-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        if let Err(error) = fs::create_dir_all(&staging) {
+            self.remote_error = Some(format!("接收拖入文件失败：无法创建临时目录：{error}"));
+            cx.notify();
             return;
         }
-        if dest_dir.starts_with(&src) {
-            return; // can't move a folder into its own descendant
+        let staging_url =
+            NSURL::fileURLWithPath(&NSString::from_str(&staging.to_string_lossy()));
+        let names: *mut NSArray<NSString> = unsafe {
+            objc2::msg_send![
+                &*promise.dragging_info,
+                namesOfPromisedFilesDroppedAtDestination: &*staging_url
+            ]
+        };
+        if names.is_null() {
+            let _ = fs::remove_dir_all(&staging);
+            self.remote_error = Some("接收拖入文件失败：微信没有交付承诺文件".to_string());
+            cx.notify();
+            return;
         }
-        let dest = dest_dir.join(name);
-        if dest.exists() {
-            return; // don't clobber existing files
-        }
-        // `mv` handles cross-volume moves (copy + delete) too.
-        let _ = Command::new("mv").arg(&src).arg(&dest).status();
-        self.refresh_all_panes(cx);
+
+        // Carbon promises may complete just after performDragOperation:
+        // returns. Poll the announced names briefly without blocking AppKit's
+        // main run loop, then use the same collision-safe copy path.
+        let promised_names = unsafe { &*names };
+        let expected_files = promised_names.count().max(1);
+        let announced: Vec<PathBuf> = (0..promised_names.count())
+            .map(|index| staging.join(promised_names.objectAtIndex(index).to_string()))
+            .collect();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    loop {
+                        let sources: Vec<PathBuf> = announced
+                            .iter()
+                            .filter(|path| path.exists())
+                            .cloned()
+                            .collect();
+                        if sources.len() >= expected_files || Instant::now() >= deadline {
+                            let delivered = Arc::new(Mutex::new(sources));
+                            let errors = Arc::new(Mutex::new(Vec::new()));
+                            return finish_file_promise_drop(
+                                &staging,
+                                &dest_dir,
+                                &delivered,
+                                &errors,
+                                expected_files,
+                            );
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.remote_error = result.err();
+                this.refresh_all_panes(cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Handle files dropped onto `dest_dir` in `pane`: upload to the server when
-    /// the pane is remote, otherwise move locally. Dropped `ExternalPaths` are
-    /// always local (from Finder or another pane), so remote = upload.
+    /// the pane is remote; locally, move only when Shuffle started the drag and
+    /// copy files dragged from WeChat, Finder, or another application.
     fn drop_files(&mut self, pane: usize, dest_dir: PathBuf, srcs: Vec<PathBuf>, cx: &mut Context<Self>) {
         if self.tab(pane).remote.is_some() {
             let locals: Vec<PathBuf> = srcs.into_iter().filter(|p| p.exists()).collect();
             if !locals.is_empty() {
                 self.upload_to_remote(pane, dest_dir, locals, cx);
             }
-        } else {
-            for s in srcs {
-                self.move_into(dest_dir.clone(), s, cx);
+        } else if !srcs.is_empty() {
+            let internal_move = SHUFFLE_FILE_DRAG_LIVE.load(Ordering::Relaxed);
+            let legacy_promise = if internal_move {
+                None
+            } else {
+                ACTIVE_NATIVE_LEGACY_PROMISE.with(|active| active.borrow().clone())
+            };
+            if let Some(promise) = legacy_promise {
+                self.receive_legacy_file_promise(dest_dir, promise, cx);
+                return;
+            }
+            let promises = if internal_move {
+                Vec::new()
+            } else {
+                ACTIVE_NATIVE_FILE_PROMISES.with(|active| active.borrow().clone())
+            };
+            if !promises.is_empty() {
+                self.receive_file_promises(dest_dir, promises, cx);
+                return;
+            }
+            // Reading NSURL objects from the live drag pasteboard consumes the
+            // temporary macOS sandbox extension supplied by apps such as
+            // WeChat. GPUI 0.2.2 only forwards legacy path strings, which loses
+            // that permission unless we reacquire it here before returning from
+            // the native drop callback.
+            let scoped_urls = if internal_move {
+                Vec::new()
+            } else {
+                begin_external_drop_access(&srcs)
+            };
+            if internal_move {
+                // Shuffle-owned moves do not depend on a source app's temporary
+                // drag permission and can safely run off the UI thread.
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_spawn(async move { move_paths_into(&dest_dir, &srcs) })
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.remote_error = result.err();
+                        this.refresh_all_panes(cx);
+                    });
+                })
+                .detach();
+            } else {
+                // AppKit's temporary access to files dragged by sandboxed apps
+                // (notably WeChat) is tied to the native drop callback. Copy
+                // before returning; deferring this work makes access disappear.
+                let result = copy_paths_into(&dest_dir, &srcs, &scoped_urls);
+                if result.is_err()
+                    && srcs.iter().any(|path| is_protected_app_container_path(path))
+                {
+                    // Return from the GPUI listener before showing AppKit UI.
+                    // The modeless panel completion later updates the entity.
+                    let this = cx.weak_entity();
+                    let dest = dest_dir.clone();
+                    let sources = srcs.clone();
+                    cx.defer(move |app| {
+                        let callback_entity = this.clone();
+                        let mut async_app = app.to_async();
+                        begin_protected_drop_confirmation(dest, sources, move |result| {
+                            let _ = callback_entity.update(&mut async_app, |this, cx| {
+                                this.remote_error = result.err();
+                                this.refresh_all_panes(cx);
+                                cx.notify();
+                            });
+                        });
+                    });
+                } else {
+                    self.remote_error = result.err();
+                    self.refresh_all_panes(cx);
+                    cx.notify();
+                }
             }
         }
     }
@@ -4038,7 +4863,10 @@ impl Shuffle {
                             tab.selection.insert(dest.clone());
                         }
                         if tab.anchor.as_deref() == Some(r.path.as_path()) {
-                            tab.anchor = Some(dest);
+                            tab.anchor = Some(dest.clone());
+                        }
+                        if tab.selection_anchor.as_deref() == Some(r.path.as_path()) {
+                            tab.selection_anchor = Some(dest);
                         }
                         self.refresh_pane(r.pane, cx);
                     }
@@ -4231,12 +5059,6 @@ impl Shuffle {
                 if cmd {
                     return;
                 }
-                if let Some(ch) = ks.key_char.clone() {
-                    if !ch.is_empty() && !ch.chars().any(char::is_control) {
-                        self.rename_insert(&ch);
-                        cx.notify();
-                    }
-                }
             }
         }
     }
@@ -4253,6 +5075,85 @@ impl Shuffle {
         let dest = unique_child(parent, &base);
         let _ = Command::new("cp").arg("-R").arg(&path).arg(&dest).status();
         self.refresh_pane(pane, cx);
+    }
+
+    /// Copy the active pane's selection as native macOS file URLs. Finder and
+    /// other apps can paste these files; this deliberately differs from the
+    /// existing "Copy path" action, which writes plain text.
+    fn copy_selected_files(&mut self, pane: usize, cx: &mut Context<Self>) {
+        if self.tab(pane).remote.is_some() {
+            self.remote_error = Some("Remote files must be downloaded before copying".into());
+            cx.notify();
+            return;
+        }
+        let selection = self.tab(pane).selection.clone();
+        let mut paths: Vec<PathBuf> = self
+            .display_paths(pane)
+            .into_iter()
+            .filter(|path| selection.contains(path) && path.exists())
+            .collect();
+        if paths.is_empty() {
+            if let Some(path) = self.tab(pane).anchor.clone().filter(|path| path.exists()) {
+                paths.push(path);
+            }
+        }
+        if !paths.is_empty() && write_file_clipboard(&paths) {
+            self.remote_error = None;
+            cx.notify();
+        }
+    }
+
+    /// Paste native file URLs from the macOS clipboard into the active folder.
+    /// Local copies run off the UI thread and use `ditto` to preserve metadata.
+    fn paste_files(&mut self, pane: usize, cx: &mut Context<Self>) {
+        let sources = read_file_clipboard();
+        if sources.is_empty() {
+            return;
+        }
+        let dest_dir = self.tab(pane).current_dir.clone();
+        if self.tab(pane).remote.is_some() {
+            let locals: Vec<PathBuf> = sources.into_iter().filter(|path| path.exists()).collect();
+            if !locals.is_empty() {
+                self.upload_to_remote(pane, dest_dir, locals, cx);
+            }
+            return;
+        }
+
+        cx.spawn(async move |this, cx| {
+            let failure = cx
+                .background_spawn(async move {
+                    for source in sources {
+                        if !source.exists() || (source.is_dir() && dest_dir.starts_with(&source)) {
+                            continue;
+                        }
+                        let Some(destination) = paste_destination(&source, &dest_dir) else {
+                            continue;
+                        };
+                        match Command::new("ditto").arg(&source).arg(&destination).status() {
+                            Ok(status) if status.success() => {}
+                            Ok(status) => {
+                                return Some(format!(
+                                    "Paste failed for {} (exit {})",
+                                    source.display(),
+                                    status.code().unwrap_or(-1)
+                                ));
+                            }
+                            Err(error) => {
+                                return Some(format!("Paste failed for {}: {error}", source.display()));
+                            }
+                        }
+                    }
+                    None
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if pane < this.panes.len() {
+                    this.remote_error = failure;
+                    this.refresh_pane(pane, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// Make a Finder alias of `path` in the same folder.
@@ -4371,6 +5272,30 @@ impl Shuffle {
         self.close_context_menu(cx);
     }
 
+    /// Open a regular file in macOS's default text editor (normally TextEdit).
+    fn edit_file(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let _ = Command::new("/usr/bin/open").arg("-e").arg(path).spawn();
+        self.close_context_menu(cx);
+    }
+
+    /// Execute a file that already has an executable permission bit. The path
+    /// is passed directly to `Command` (never through a shell), and Shuffle does
+    /// not chmod files implicitly.
+    fn run_executable(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if is_executable_file(path) {
+            let mut command = Command::new(path);
+            if let Some(parent) = path.parent() {
+                command.current_dir(parent);
+            }
+            let _ = command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+        }
+        self.close_context_menu(cx);
+    }
+
     /// Set (or clear, index 0) the Finder color label / tag on `path`.
     fn set_tag(&mut self, pane: usize, path: PathBuf, label: u8, cx: &mut Context<Self>) {
         let script = format!(
@@ -4471,28 +5396,48 @@ impl Shuffle {
         if self.tab(pane).remote.is_some() {
             return self.menu_remote(pane, target, cx);
         }
+        let terminal_target = target.clone();
         let mut items: Vec<AnyElement> = Vec::new();
         if let Some((path, is_dir)) = target {
             let p = path.clone();
             items.push(
-                ctx_item("Open", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                ctx_item("打开", cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.close_context_menu(cx);
                     this.open_path(pane, p.clone(), is_dir, cx);
                 }))
                 .into_any_element(),
             );
+            let open_with_submenu = self
+                .menu_view_is(MenuView::OpenWith)
+                .then(|| ctx_menu_panel(self.menu_open_with(pane, path.clone(), cx)));
             items.push(
-                ctx_parent("Open With", cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.set_menu_view(MenuView::OpenWith, cx);
-                }))
+                ctx_parent("打开方式", MenuView::OpenWith, open_with_submenu, cx)
                 .into_any_element(),
             );
+            if !is_dir {
+                let p = path.clone();
+                items.push(
+                    ctx_item("编辑", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.edit_file(&p, cx);
+                    }))
+                    .into_any_element(),
+                );
+            }
+            if !is_dir && is_executable_file(&path) {
+                let p = path.clone();
+                items.push(
+                    ctx_item("运行", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.run_executable(&p, cx);
+                    }))
+                    .into_any_element(),
+                );
+            }
             // Type-specific actions, Finder-style: archives extract in place,
             // app bundles reveal their contents.
             if archive_suffix(&path).is_some() {
                 let p = path.clone();
                 items.push(
-                    ctx_item("Extract Here", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    ctx_item("解压到此处", cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.close_context_menu(cx);
                         this.extract_archive(pane, p.clone(), cx);
                     }))
@@ -4503,7 +5448,7 @@ impl Shuffle {
                 let p = path.clone();
                 items.push(
                     ctx_item(
-                        "Show Package Contents",
+                        "显示包内容",
                         cx.listener(move |this, _: &ClickEvent, _, cx| {
                             this.close_context_menu(cx);
                             this.navigate_in(pane, p.clone(), cx);
@@ -4544,7 +5489,7 @@ impl Shuffle {
             items.push(ctx_separator().into_any_element());
             let p = path.clone();
             items.push(
-                ctx_item("Rename", cx.listener(move |this, _: &ClickEvent, window, cx| {
+                ctx_item("重命名", cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.close_context_menu(cx);
                     this.begin_rename(pane, p.clone(), window, cx);
                 }))
@@ -4552,7 +5497,7 @@ impl Shuffle {
             );
             let p = path.clone();
             items.push(
-                ctx_item("Reveal in Finder", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                ctx_item("在访达中显示", cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.close_context_menu(cx);
                     let _ = Command::new("open").arg("-R").arg(&p).spawn();
                 }))
@@ -4560,7 +5505,7 @@ impl Shuffle {
             );
             let p = path.clone();
             items.push(
-                ctx_item("Copy Path", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                ctx_item("复制路径", cx.listener(move |this, _: &ClickEvent, _, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(p.to_string_lossy().into_owned()));
                     this.close_context_menu(cx);
                 }))
@@ -4570,7 +5515,7 @@ impl Shuffle {
             let already = self.bookmarks.iter().any(|b| b == &p);
             items.push(
                 ctx_item(
-                    if already { "Remove Bookmark" } else { "Add to Bookmarks" },
+                    if already { "移除书签" } else { "添加到书签" },
                     cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.close_context_menu(cx);
                         if already {
@@ -4584,16 +5529,17 @@ impl Shuffle {
             );
             // "Add to Group ▸" submenu (only when groups are enabled and exist).
             if prefs().groups_enabled && !self.groups.is_empty() {
+                let group_submenu = self
+                    .menu_view_is(MenuView::AddToGroup)
+                    .then(|| ctx_menu_panel(self.menu_add_to_group(path.clone(), cx)));
                 items.push(
-                    ctx_parent("Add to Group", cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.set_menu_view(MenuView::AddToGroup, cx);
-                    }))
+                    ctx_parent("添加到分组", MenuView::AddToGroup, group_submenu, cx)
                     .into_any_element(),
                 );
             }
             let p = path.clone();
             items.push(
-                ctx_item("Duplicate", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                ctx_item("制作副本", cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.close_context_menu(cx);
                     this.duplicate_entry(pane, p.clone(), cx);
                 }))
@@ -4601,7 +5547,7 @@ impl Shuffle {
             );
             let p = path.clone();
             items.push(
-                ctx_item("Make Alias", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                ctx_item("制作替身", cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.close_context_menu(cx);
                     this.make_alias(pane, p.clone(), cx);
                 }))
@@ -4609,7 +5555,7 @@ impl Shuffle {
             );
             let p = path.clone();
             items.push(
-                ctx_item("Compress", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                ctx_item("压缩", cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.close_context_menu(cx);
                     this.compress_entry(pane, p.clone(), cx);
                 }))
@@ -4619,42 +5565,65 @@ impl Shuffle {
             items.push(ctx_separator().into_any_element());
             let p = path.clone();
             items.push(
-                ctx_item("Move to Trash", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                ctx_item("移到废纸篓", cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.close_context_menu(cx);
-                    this.move_to_trash(pane, p.clone(), cx);
+                    this.request_delete_target(pane, p.clone(), cx);
                 }))
                 .into_any_element(),
             );
             items.push(ctx_separator().into_any_element());
+            let tags_submenu = self
+                .menu_view_is(MenuView::Tags)
+                .then(|| ctx_menu_panel(self.menu_tags(pane, path.clone(), cx)));
             items.push(
-                ctx_parent("Tags", cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.set_menu_view(MenuView::Tags, cx);
-                }))
+                ctx_parent("标签", MenuView::Tags, tags_submenu, cx)
                 .into_any_element(),
             );
+            let quick_actions_submenu = self
+                .menu_view_is(MenuView::QuickActions)
+                .then(|| ctx_menu_panel(self.menu_quick_actions(pane, path.clone(), cx)));
             items.push(
-                ctx_parent("Quick Actions", cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.set_menu_view(MenuView::QuickActions, cx);
-                }))
+                ctx_parent(
+                    "快速操作",
+                    MenuView::QuickActions,
+                    quick_actions_submenu,
+                    cx,
+                )
                 .into_any_element(),
             );
+            let services_submenu = self
+                .menu_view_is(MenuView::Services)
+                .then(|| ctx_menu_panel(self.menu_services(pane, path.clone(), is_dir, cx)));
             items.push(
-                ctx_parent("Services", cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.set_menu_view(MenuView::Services, cx);
-                }))
+                ctx_parent("服务", MenuView::Services, services_submenu, cx)
+                .into_any_element(),
+            );
+            items.push(ctx_separator().into_any_element());
+        }
+        if !installed_terminals().is_empty() {
+            let terminal_submenu = self
+                .menu_view_is(MenuView::Terminal)
+                .then(|| ctx_menu_panel(self.menu_terminal(pane, terminal_target, cx)));
+            items.push(
+                ctx_parent(
+                    "在终端中打开",
+                    MenuView::Terminal,
+                    terminal_submenu,
+                    cx,
+                )
                 .into_any_element(),
             );
             items.push(ctx_separator().into_any_element());
         }
         items.push(
-            ctx_item("New Folder", cx.listener(move |this, _: &ClickEvent, window, cx| {
+            ctx_item("新建文件夹", cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.close_context_menu(cx);
                 this.new_folder(pane, window, cx);
             }))
             .into_any_element(),
         );
         items.push(
-            ctx_item("New File", cx.listener(move |this, _: &ClickEvent, window, cx| {
+            ctx_item("新建文件", cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.close_context_menu(cx);
                 this.new_file(pane, window, cx);
             }))
@@ -4676,7 +5645,7 @@ impl Shuffle {
             let p = path.clone();
             items.push(
                 ctx_item(
-                    if is_dir { "Open" } else { "Open (Download)" },
+                    if is_dir { "打开" } else { "打开（先下载）" },
                     cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.close_context_menu(cx);
                         this.open_path(pane, p.clone(), is_dir, cx);
@@ -4687,7 +5656,7 @@ impl Shuffle {
             if !is_dir {
                 let p = path.clone();
                 items.push(
-                    ctx_item("Download to Downloads", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    ctx_item("下载到“下载”文件夹", cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.close_context_menu(cx);
                         this.download_remote(pane, p.clone(), None, false, cx);
                     }))
@@ -4697,7 +5666,7 @@ impl Shuffle {
             items.push(ctx_separator().into_any_element());
             let p = path.clone();
             items.push(
-                ctx_item("Rename", cx.listener(move |this, _: &ClickEvent, window, cx| {
+                ctx_item("重命名", cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.close_context_menu(cx);
                     this.begin_rename(pane, p.clone(), window, cx);
                 }))
@@ -4705,7 +5674,7 @@ impl Shuffle {
             );
             let p = path.clone();
             items.push(
-                ctx_item("Copy Path", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                ctx_item("复制路径", cx.listener(move |this, _: &ClickEvent, _, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(p.to_string_lossy().into_owned()));
                     this.close_context_menu(cx);
                 }))
@@ -4714,24 +5683,23 @@ impl Shuffle {
             items.push(ctx_separator().into_any_element());
             let p = path.clone();
             items.push(
-                ctx_item("Delete from Server", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                ctx_item("从服务器删除", cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.close_context_menu(cx);
-                    this.confirm_delete = Some((pane, vec![p.clone()]));
-                    cx.notify();
+                    this.request_delete_target(pane, p.clone(), cx);
                 }))
                 .into_any_element(),
             );
             items.push(ctx_separator().into_any_element());
         }
         items.push(
-            ctx_item("New Folder", cx.listener(move |this, _: &ClickEvent, window, cx| {
+            ctx_item("新建文件夹", cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.close_context_menu(cx);
                 this.new_folder(pane, window, cx);
             }))
             .into_any_element(),
         );
         items.push(
-            ctx_item("New File", cx.listener(move |this, _: &ClickEvent, window, cx| {
+            ctx_item("新建文件", cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.close_context_menu(cx);
                 this.new_file(pane, window, cx);
             }))
@@ -4742,16 +5710,10 @@ impl Shuffle {
 
     /// "Open With" submenu — apps that can open the target (via LaunchServices).
     fn menu_open_with(&self, _pane: usize, path: PathBuf, cx: &Context<Self>) -> Vec<AnyElement> {
-        let mut items: Vec<AnyElement> = vec![
-            ctx_item("‹ Back", cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.set_menu_view(MenuView::Root, cx);
-            }))
-            .into_any_element(),
-            ctx_separator().into_any_element(),
-        ];
+        let mut items: Vec<AnyElement> = Vec::new();
         let apps = apps_for_file(&path);
         if apps.is_empty() {
-            items.push(ctx_disabled("No applications").into_any_element());
+            items.push(ctx_disabled("没有可用的应用程序").into_any_element());
         }
         for (i, (name, app)) in apps.into_iter().enumerate() {
             let p = path.clone();
@@ -4767,15 +5729,9 @@ impl Shuffle {
 
     /// "Add to Group" submenu — one row per group.
     fn menu_add_to_group(&self, path: PathBuf, cx: &Context<Self>) -> Vec<AnyElement> {
-        let mut items: Vec<AnyElement> = vec![
-            ctx_item("‹ Back", cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.set_menu_view(MenuView::Root, cx);
-            }))
-            .into_any_element(),
-            ctx_separator().into_any_element(),
-        ];
+        let mut items: Vec<AnyElement> = Vec::new();
         if self.groups.is_empty() {
-            items.push(ctx_disabled("No groups").into_any_element());
+            items.push(ctx_disabled("没有分组").into_any_element());
         }
         for (i, g) in self.groups.iter().enumerate() {
             let p = path.clone();
@@ -4800,22 +5756,16 @@ impl Shuffle {
     fn menu_tags(&self, pane: usize, path: PathBuf, cx: &Context<Self>) -> Vec<AnyElement> {
         // (name, color dot, Finder label index)
         const TAGS: &[(&str, u32, u8)] = &[
-            ("None", 0x6b6b73, 0),
-            ("Red", 0xff5f57, 6),
-            ("Orange", 0xff9f0a, 7),
-            ("Yellow", 0xffd60a, 5),
-            ("Green", 0x34c759, 2),
-            ("Blue", 0x0a84ff, 4),
-            ("Purple", 0xbf5af0, 3),
-            ("Gray", 0x8e8e93, 1),
+            ("无", 0x6b6b73, 0),
+            ("红色", 0xff5f57, 6),
+            ("橙色", 0xff9f0a, 7),
+            ("黄色", 0xffd60a, 5),
+            ("绿色", 0x34c759, 2),
+            ("蓝色", 0x0a84ff, 4),
+            ("紫色", 0xbf5af0, 3),
+            ("灰色", 0x8e8e93, 1),
         ];
-        let mut items: Vec<AnyElement> = vec![
-            ctx_item("‹ Back", cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.set_menu_view(MenuView::Root, cx);
-            }))
-            .into_any_element(),
-            ctx_separator().into_any_element(),
-        ];
+        let mut items: Vec<AnyElement> = Vec::new();
         for (i, (name, color, label)) in TAGS.iter().enumerate() {
             let (name, color, label) = (*name, *color, *label);
             let p = path.clone();
@@ -4831,31 +5781,25 @@ impl Shuffle {
 
     /// "Quick Actions" submenu — image/PDF operations via built-in tools.
     fn menu_quick_actions(&self, pane: usize, path: PathBuf, cx: &Context<Self>) -> Vec<AnyElement> {
-        let mut items: Vec<AnyElement> = vec![
-            ctx_item("‹ Back", cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.set_menu_view(MenuView::Root, cx);
-            }))
-            .into_any_element(),
-            ctx_separator().into_any_element(),
-        ];
+        let mut items: Vec<AnyElement> = Vec::new();
 
         let img = is_image(&path);
         let pdf = is_pdf(&path);
 
         if img {
             let p = path.clone();
-            items.push(ctx_item("Rotate Left", cx.listener(move |this, _: &ClickEvent, _, cx| {
+            items.push(ctx_item("向左旋转", cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.rotate_image(pane, p.clone(), -90, cx);
             })).into_any_element());
             let p = path.clone();
-            items.push(ctx_item("Rotate Right", cx.listener(move |this, _: &ClickEvent, _, cx| {
+            items.push(ctx_item("向右旋转", cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.rotate_image(pane, p.clone(), 90, cx);
             })).into_any_element());
         }
 
         if img || pdf {
             let p = path.clone();
-            items.push(ctx_item("Markup", cx.listener(move |this, _: &ClickEvent, _, cx| {
+            items.push(ctx_item("标记", cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.close_context_menu(cx);
                 let _ = Command::new("open").arg("-a").arg("Preview").arg(&p).spawn();
             })).into_any_element());
@@ -4863,14 +5807,14 @@ impl Shuffle {
 
         if img {
             let p = path.clone();
-            items.push(ctx_item("Create PDF", cx.listener(move |this, _: &ClickEvent, _, cx| {
+            items.push(ctx_item("创建 PDF", cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.convert_image(pane, p.clone(), "pdf", "pdf", cx);
             })).into_any_element());
             // Convert Image to … (sips formats).
             for (i, (label, fmt, ext)) in [
-                ("Convert to JPEG", "jpeg", "jpg"),
-                ("Convert to PNG", "png", "png"),
-                ("Convert to HEIC", "heic", "heic"),
+                ("转换为 JPEG", "jpeg", "jpg"),
+                ("转换为 PNG", "png", "png"),
+                ("转换为 HEIC", "heic", "heic"),
             ].iter().enumerate()
             {
                 let (fmt, ext) = (fmt.to_string(), ext.to_string());
@@ -4885,33 +5829,27 @@ impl Shuffle {
             // Remove Background (native Vision helper, if compiled in).
             if removebg_path().is_some() {
                 let p = path.clone();
-                items.push(ctx_item("Remove Background", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                items.push(ctx_item("移除背景", cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.remove_background(pane, p.clone(), cx);
                 })).into_any_element());
             }
         }
 
         if !img && !pdf {
-            items.push(ctx_disabled("No quick actions").into_any_element());
+            items.push(ctx_disabled("没有可用的快速操作").into_any_element());
         }
         items
     }
 
     /// "Services" submenu — a useful, implementable subset of Finder's services.
     fn menu_services(&self, _pane: usize, path: PathBuf, is_dir: bool, cx: &Context<Self>) -> Vec<AnyElement> {
-        let mut items: Vec<AnyElement> = vec![
-            ctx_item("‹ Back", cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.set_menu_view(MenuView::Root, cx);
-            }))
-            .into_any_element(),
-            ctx_separator().into_any_element(),
-        ];
+        let mut items: Vec<AnyElement> = Vec::new();
 
         let mut any = false;
         if is_image(&path) {
             any = true;
             let p = path.clone();
-            items.push(ctx_item("Set Desktop Picture", cx.listener(move |this, _: &ClickEvent, _, cx| {
+            items.push(ctx_item("设为桌面图片", cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.set_desktop_picture(p.clone(), cx);
             })).into_any_element());
         }
@@ -4924,7 +5862,7 @@ impl Shuffle {
             any = true;
             let d = dir.clone();
             items.push(
-                ctx_app(200 + i, format!("Open in {name}"), cx.listener(move |this, _: &ClickEvent, _, cx| {
+                ctx_app(200 + i, format!("在 {name} 中打开"), cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.close_context_menu(cx);
                     let _ = Command::new("open").arg("-a").arg(&app).arg(&d).spawn();
                 }))
@@ -4933,7 +5871,43 @@ impl Shuffle {
         }
 
         if !any {
-            items.push(ctx_disabled("No services").into_any_element());
+            items.push(ctx_disabled("没有可用的服务").into_any_element());
+        }
+        items
+    }
+
+    /// Top-level "Open in Terminal" submenu. A file opens its containing
+    /// folder; a folder or blank-area click opens that directory itself.
+    fn menu_terminal(
+        &self,
+        pane: usize,
+        target: Option<(PathBuf, bool)>,
+        cx: &Context<Self>,
+    ) -> Vec<AnyElement> {
+        let mut items: Vec<AnyElement> = Vec::new();
+        let current = self.tab(pane).current_dir.clone();
+        let dir = match target {
+            Some((path, true)) => path,
+            Some((path, false)) => path.parent().map(Path::to_path_buf).unwrap_or(current),
+            None => current,
+        };
+        let terminals = installed_terminals();
+        if terminals.is_empty() {
+            items.push(ctx_disabled("没有可用的终端应用").into_any_element());
+        }
+        for (i, (name, app)) in terminals.into_iter().enumerate() {
+            let d = dir.clone();
+            items.push(
+                ctx_app(
+                    300 + i,
+                    format!("在 {name} 中打开"),
+                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_context_menu(cx);
+                        let _ = Command::new("open").arg("-a").arg(&app).arg(&d).spawn();
+                    }),
+                )
+                .into_any_element(),
+            );
         }
         items
     }
@@ -4941,14 +5915,7 @@ impl Shuffle {
     fn render_context_menu(&self, cx: &Context<Self>) -> impl IntoElement {
         let menu = self.context_menu.as_ref().expect("called only when open");
         let pane = menu.pane;
-        let items: Vec<AnyElement> = match (menu.view, menu.target.clone()) {
-            (MenuView::OpenWith, Some((path, _))) => self.menu_open_with(pane, path, cx),
-            (MenuView::AddToGroup, Some((path, _))) => self.menu_add_to_group(path, cx),
-            (MenuView::Tags, Some((path, _))) => self.menu_tags(pane, path, cx),
-            (MenuView::QuickActions, Some((path, _))) => self.menu_quick_actions(pane, path, cx),
-            (MenuView::Services, Some((path, is_dir))) => self.menu_services(pane, path, is_dir, cx),
-            (_, target) => self.menu_root(pane, target, cx),
-        };
+        let root_items = self.menu_root(pane, menu.target.clone(), cx);
 
         // Full-window backdrop: any click/right-click outside closes the menu.
         div()
@@ -4972,21 +5939,7 @@ impl Shuffle {
                 anchored()
                     .position(point(px(menu.x), px(menu.y)))
                     .snap_to_window()
-                    .child(
-                        div()
-                            .min_w(px(200.0))
-                            .py_1()
-                            .bg(menu_style().bg_rgba())
-                            .text_color(rgb(menu_style().text))
-                            .text_size(px(menu_style().font_px))
-                            .rounded_md()
-                            .border_1()
-                            .border_color(rgb(theme().border_strong))
-                            .shadow_lg()
-                            // Clicks inside the menu shouldn't close it via the backdrop.
-                            .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| cx.stop_propagation())
-                            .children(items),
-                    ),
+                    .child(ctx_menu_panel(root_items)),
             )
     }
 
@@ -5342,14 +6295,6 @@ impl Shuffle {
                 if cmd {
                     return;
                 }
-                if let Some(ch) = ks.key_char.as_ref() {
-                    if !ch.is_empty() && !ch.chars().any(char::is_control) {
-                        if let Some(f) = self.server_dialog.as_mut() {
-                            f.active_field().push_str(ch);
-                        }
-                        cx.notify();
-                    }
-                }
             }
         }
     }
@@ -5394,6 +6339,13 @@ impl Shuffle {
         // A labeled input row for the Credentials tab.
         let field_row = |label: &'static str, cf: CredField, value: &str, secret: bool| {
             let focused = mode == ServerMode::Credentials && form.field == cf;
+            let ime_target = match cf {
+                CredField::Name => ImeTarget::ServerName,
+                CredField::Host => ImeTarget::ServerHost,
+                CredField::User => ImeTarget::ServerUser,
+                CredField::Port => ImeTarget::ServerPort,
+                CredField::Password => ImeTarget::ServerPassword,
+            };
             let empty = value.is_empty();
             let shown = if empty {
                 label.to_string()
@@ -5410,6 +6362,7 @@ impl Shuffle {
                 .child(
                     div()
                         .id(label)
+                        .relative()
                         .flex()
                         .items_center()
                         .px_3()
@@ -5421,6 +6374,7 @@ impl Shuffle {
                         .text_color(rgb(if empty { t.text_dim } else { t.text }))
                         .cursor_pointer()
                         .child(shown)
+                        .children(self.ime_anchor(ime_target, cx))
                         .when(focused, |d| {
                             d.child(div().w(px(1.5)).h(px(15.0)).ml(px(1.0)).bg(rgb(t.text)))
                         })
@@ -5472,6 +6426,7 @@ impl Shuffle {
                     ))
                     .child(
                         div()
+                            .relative()
                             .flex()
                             .items_center()
                             .px_3()
@@ -5482,6 +6437,7 @@ impl Shuffle {
                             .border_color(rgb(t.accent))
                             .text_color(rgb(if empty { t.text_dim } else { t.text }))
                             .child(shown)
+                            .children(self.ime_anchor(ImeTarget::ServerQuick, cx))
                             .child(div().w(px(1.5)).h(px(15.0)).ml(px(1.0)).bg(rgb(t.text))),
                     )
                     .child(recent)
@@ -5547,6 +6503,7 @@ impl Shuffle {
                     .child(
                         // "Reconnect on launch" toggle for this server.
                         div()
+                            .relative()
                             .flex()
                             .items_center()
                             .gap_2()
@@ -5750,7 +6707,8 @@ impl Shuffle {
                             .border_1()
                             .border_color(rgb(t.accent))
                             .text_color(rgb(if placeholder { t.text_dim } else { t.text }))
-                            .child(shown),
+                            .child(shown)
+                            .children(self.ime_anchor(ImeTarget::Group, cx)),
                     )
                     .child(
                         div()
@@ -5803,7 +6761,7 @@ impl Shuffle {
             SidebarTarget::Empty => {
                 if groups_on {
                     items.push(
-                        ctx_item("New Group", cx.listener(|this, _: &ClickEvent, _, cx| {
+                        ctx_item("新建分组", cx.listener(|this, _: &ClickEvent, _, cx| {
                             this.close_sidebar_menu(cx);
                             this.open_group_dialog(cx);
                         }))
@@ -5813,7 +6771,7 @@ impl Shuffle {
             }
             SidebarTarget::Bookmark(p) => {
                 items.push(
-                    ctx_item("Remove Bookmark", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    ctx_item("移除书签", cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.close_sidebar_menu(cx);
                         this.remove_bookmark(&p, cx);
                     }))
@@ -5823,7 +6781,7 @@ impl Shuffle {
             SidebarTarget::GroupHeader(idx) => {
                 if groups_on {
                     items.push(
-                        ctx_item("New Group", cx.listener(|this, _: &ClickEvent, _, cx| {
+                        ctx_item("新建分组", cx.listener(|this, _: &ClickEvent, _, cx| {
                             this.close_sidebar_menu(cx);
                             this.open_group_dialog(cx);
                         }))
@@ -5832,7 +6790,7 @@ impl Shuffle {
                     items.push(ctx_separator().into_any_element());
                 }
                 items.push(
-                    ctx_item("Delete Group", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    ctx_item("删除分组", cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.close_sidebar_menu(cx);
                         this.delete_group(idx, cx);
                     }))
@@ -5841,7 +6799,7 @@ impl Shuffle {
             }
             SidebarTarget::GroupMember(idx, p) => {
                 items.push(
-                    ctx_item("Remove from Group", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    ctx_item("从分组中移除", cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.close_sidebar_menu(cx);
                         this.remove_from_group(idx, &p, cx);
                     }))
@@ -5851,7 +6809,7 @@ impl Shuffle {
             SidebarTarget::Sftp(server) => {
                 let s = server.clone();
                 items.push(
-                    ctx_item("Connect", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    ctx_item("连接", cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.close_sidebar_menu(cx);
                         this.connect_sftp(s.clone(), cx);
                     }))
@@ -5859,14 +6817,14 @@ impl Shuffle {
                 );
                 let s = server.clone();
                 items.push(
-                    ctx_item("Edit\u{2026}", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    ctx_item("编辑\u{2026}", cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.edit_server(&s, cx);
                     }))
                     .into_any_element(),
                 );
                 let s = server.clone();
                 items.push(
-                    ctx_item("Remove", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    ctx_item("移除", cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.close_sidebar_menu(cx);
                         if s.use_password {
                             keychain_delete_password(&s);
@@ -5882,7 +6840,7 @@ impl Shuffle {
             }
         }
         if items.is_empty() {
-            items.push(ctx_disabled("No actions").into_any_element());
+            items.push(ctx_disabled("没有可用的操作").into_any_element());
         }
 
         div()
@@ -6184,7 +7142,7 @@ impl Shuffle {
     /// Default items shown when the query is empty: the available commands.
     fn default_commands(&self) -> Vec<PaletteItem> {
         vec![PaletteItem {
-            title: "Copy current directory".to_string(),
+            title: "复制当前目录路径".to_string(),
             subtitle: self.active_tab().current_dir.to_string_lossy().into_owned(),
             action: Action::CopyDir,
             is_dir: true,
@@ -6200,6 +7158,9 @@ impl Shuffle {
         self.palette_actions = None;
         self.palette_scroll.set_offset(point(px(0.0), px(0.0)));
         let q = self.query.trim().to_string();
+        let scope = self.palette_search_scope;
+        let sort = self.palette_search_sort;
+        let current_dir = self.active_tab().current_dir.clone();
 
         if q.is_empty() {
             self.palette_items = self.default_commands();
@@ -6214,7 +7175,7 @@ impl Shuffle {
             let (base, partial) = split_path_query(&q);
             if !base.is_dir() {
                 self.palette_items = vec![PaletteItem {
-                    title: "Path not found".to_string(),
+                    title: "路径不存在".to_string(),
                     subtitle: base.to_string_lossy().into_owned(),
                     action: Action::None,
                     is_dir: false,
@@ -6223,7 +7184,8 @@ impl Shuffle {
                 return;
             }
 
-            let mut scored: Vec<(i32, String, bool)> = list_dir_names(&base)
+            let mut scored: Vec<(i32, String, bool)> =
+                list_dir_names(&base, prefs().show_hidden)
                 .into_iter()
                 .map(|(name, is_dir)| {
                     let score = if partial.is_empty() {
@@ -6269,7 +7231,7 @@ impl Shuffle {
         }
 
         // Operator-driven search: content:/kind:/ext:/size:/date: run a
-        // dedicated global search (Spotlight for content, the index otherwise)
+        // dedicated scoped search (Spotlight for content, the index otherwise)
         // instead of the plain fuzzy name lookup below.
         let fq = FilterQuery::parse(&q);
         if fq.content.is_some() || fq.has_local_filters() {
@@ -6277,7 +7239,10 @@ impl Shuffle {
             self.selected = 0;
             cx.notify();
             let index = self.index.clone();
-            let home = home_dir();
+            let root = match scope {
+                PaletteSearchScope::Current => current_dir,
+                PaletteSearchScope::Global => home_dir(),
+            };
             cx.spawn(async move |this, cx| {
                 cx.background_executor()
                     .timer(Duration::from_millis(40))
@@ -6287,7 +7252,7 @@ impl Shuffle {
                 }
                 let results = cx
                     .background_spawn(async move {
-                        palette_operator_search(&fq, index.as_deref(), &home)
+                        palette_operator_search(&fq, index.as_deref(), &root, sort)
                     })
                     .await;
                 this.update(cx, |this, cx| {
@@ -6307,12 +7272,20 @@ impl Shuffle {
         // Search from the very first character (the in-memory index is fast
         // enough). Empty queries were already handled above.
 
-        // Built-in commands (e.g. Settings) show instantly, ahead of the
-        // async file results, so typing "settings" surfaces it immediately.
-        self.palette_items = command_matches(&q);
+        // Built-in commands (e.g. Settings) stay in the global relevance mode.
+        // Current-folder/type/time modes contain only file results, so their
+        // ordering remains meaningful.
+        self.palette_items = if scope == PaletteSearchScope::Global
+            && sort == PaletteSearchSort::Relevance
+        {
+            command_matches(&q)
+        } else {
+            Vec::new()
+        };
         self.selected = 0;
         cx.notify();
         let index = self.index.clone();
+        let root = (scope == PaletteSearchScope::Current).then_some(current_dir);
         cx.spawn(async move |this, cx| {
             // Debounce: bail if a newer keystroke superseded us.
             cx.background_executor()
@@ -6325,14 +7298,30 @@ impl Shuffle {
             // In-memory index (fast, true fuzzy) once built; Spotlight until then.
             let qs = q.clone();
             let hits = match index {
-                Some(idx) => cx.background_spawn(async move { idx.search(&qs, 40) }).await,
-                None => cx.background_spawn(async move { search_filesystem(&qs) }).await,
+                Some(idx) => {
+                    cx.background_spawn(async move {
+                        idx.search_scoped(&qs, 40, root.as_deref(), sort)
+                    })
+                    .await
+                }
+                None => {
+                    cx.background_spawn(async move {
+                        search_filesystem(&qs, root.as_deref(), sort, 40)
+                    })
+                    .await
+                }
             };
             this.update(cx, |this, cx| {
                 if this.search_gen != gen {
                     return;
                 }
-                let mut items = command_matches(&q);
+                let mut items = if scope == PaletteSearchScope::Global
+                    && sort == PaletteSearchSort::Relevance
+                {
+                    command_matches(&q)
+                } else {
+                    Vec::new()
+                };
                 items.extend(hits.into_iter().map(|(name, path, is_dir)| {
                     let subtitle = path.to_string_lossy().into_owned();
                     PaletteItem {
@@ -6422,17 +7411,17 @@ impl Shuffle {
     fn palette_action_list(&self) -> Vec<(PaletteAction, &'static str)> {
         match self.palette_items.get(self.selected).map(|i| &i.action) {
             Some(Action::Open(_, true)) => vec![
-                (PaletteAction::Open, "Open folder"),
-                (PaletteAction::OpenNewTab, "Open in new tab"),
-                (PaletteAction::RevealFinder, "Reveal in Finder"),
-                (PaletteAction::CopyPath, "Copy path"),
+                (PaletteAction::Open, "打开文件夹"),
+                (PaletteAction::OpenNewTab, "在新标签页中打开"),
+                (PaletteAction::RevealFinder, "在访达中显示"),
+                (PaletteAction::CopyPath, "复制路径"),
             ],
             Some(Action::Open(_, false)) => vec![
-                (PaletteAction::Open, "Open file"),
-                (PaletteAction::RevealShuffle, "Show in enclosing folder"),
-                (PaletteAction::OpenNewTab, "Open folder in new tab"),
-                (PaletteAction::RevealFinder, "Reveal in Finder"),
-                (PaletteAction::CopyPath, "Copy path"),
+                (PaletteAction::Open, "打开文件"),
+                (PaletteAction::RevealShuffle, "在所在文件夹中显示"),
+                (PaletteAction::OpenNewTab, "在新标签页中打开所在文件夹"),
+                (PaletteAction::RevealFinder, "在访达中显示"),
+                (PaletteAction::CopyPath, "复制路径"),
             ],
             _ => Vec::new(),
         }
@@ -6503,6 +7492,8 @@ impl Shuffle {
                 self.tab_mut(pane).selection = all;
                 cx.notify();
             }
+            KeyAction::Copy => self.copy_selected_files(pane, cx),
+            KeyAction::Paste => self.paste_files(pane, cx),
             KeyAction::NewFile => self.new_file(pane, window, cx),
             KeyAction::NewFolder => self.new_folder(pane, window, cx),
             KeyAction::Rename => {
@@ -6536,6 +7527,7 @@ impl Shuffle {
                     let _ = Command::new("open").arg("-R").arg(&p).spawn();
                 }
             }
+            KeyAction::QuickLook => self.toggle_quick_look(pane, cx),
             KeyAction::Open => {
                 if let Some(p) = anchor {
                     let is_dir = p.is_dir();
@@ -6613,6 +7605,12 @@ impl Shuffle {
         // still opens the palette).
         if self.term_focused && prefs().terminal && !(cmd && key == "p") {
             self.handle_term_key(ev, cx);
+            return;
+        }
+
+        // Escape also dismisses a Quick Look panel that Shuffle launched.
+        if key == "escape" && self.close_quick_look() {
+            cx.notify();
             return;
         }
 
@@ -6783,12 +7781,6 @@ impl Shuffle {
             _ => {
                 if cmd {
                     return; // ignore other Cmd-combos
-                }
-                if let Some(ch) = ks.key_char.as_ref() {
-                    if !ch.is_empty() && !ch.chars().any(|c| c.is_control()) {
-                        self.palette_insert(ch);
-                        self.refresh_palette(cx);
-                    }
                 }
             }
         }
@@ -6972,6 +7964,12 @@ impl Shuffle {
             .enumerate()
             .map(|(i, item)| {
                 let selected = i == self.selected;
+                // Search results are one-row UI just like the main file list.
+                // Keep legal control characters in the real path/action, but
+                // collapse them in the painted label so they cannot create a
+                // second visual line and spill into a neighbouring result.
+                let title = single_line_name(&item.title);
+                let subtitle = single_line_name(&item.subtitle);
                 // Commands get a glyph (gear for Settings); files/dirs get real
                 // Finder icons.
                 let icon: AnyElement = if matches!(item.action, Action::OpenSettings) {
@@ -6987,29 +7985,54 @@ impl Shuffle {
                     .gap_2()
                     .px_3()
                     .h(px(PALETTE_ROW_H))
+                    .min_h(px(PALETTE_ROW_H))
+                    .max_h(px(PALETTE_ROW_H))
+                    .whitespace_nowrap()
+                    .overflow_hidden()
                     .cursor_pointer();
                 let base = if selected {
                     base.bg(rgb(t.selected))
                 } else {
                     base.hover(|s| s.bg(rgb(t.hover)))
                 };
-                base.child(div().flex_none().w(px(18.0)).flex().justify_center().child(icon))
+                base.child(
+                    div()
+                        .flex_none()
+                        .w(px(18.0))
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icon),
+                )
                     .child(
                         div()
                             .flex()
-                            .items_baseline()
+                            .items_center()
                             .gap_2()
+                            .h_full()
                             .min_w_0()
                             .flex_1()
-                            .child(div().flex_none().text_color(rgb(t.text)).child(item.title.clone()))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .max_w(relative(0.55))
+                                    .truncate()
+                                    .whitespace_nowrap()
+                                    .text_color(rgb(t.text))
+                                    .child(title),
+                            )
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
+                                    .whitespace_nowrap()
                                     .text_xs()
                                     .text_color(rgb(t.text_muted))
-                                    .child(item.subtitle.clone()),
+                                    .child(subtitle),
                             ),
                     )
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -7026,7 +8049,7 @@ impl Shuffle {
         let input = if self.query.is_empty() {
             div()
                 .text_color(rgb(t.text_dim))
-                .child("Type a path, or a file/folder name…")
+                .child("输入路径，或搜索文件/文件夹…")
         } else if let Some((lo, hi)) = self.query_sel() {
             let (bl, bh) = (self.query_byte(lo), self.query_byte(hi));
             div()
@@ -7052,12 +8075,70 @@ impl Shuffle {
 
         // What Enter would do to the current selection (footer hint).
         let enter_label = match self.palette_items.get(self.selected).map(|i| &i.action) {
-            Some(Action::Open(_, true)) => "Open folder",
-            Some(Action::Open(_, false)) => "Open file",
-            Some(_) => "Run",
-            None => "Open",
+            Some(Action::Open(_, true)) => "打开文件夹",
+            Some(Action::Open(_, false)) => "打开文件",
+            Some(_) => "运行",
+            None => "打开",
         };
         let has_actions = !self.palette_action_list().is_empty();
+
+        let scope_controls: Vec<AnyElement> = [
+            PaletteSearchScope::Current,
+            PaletteSearchScope::Global,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, scope)| {
+            let active = self.palette_search_scope == scope;
+            div()
+                .id(("palette-scope", i))
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .text_xs()
+                .text_color(rgb(if active { t.text } else { t.text_muted }))
+                .when(active, |chip| chip.bg(rgb(t.selected)))
+                .when(!active, |chip| chip.hover(|chip| chip.bg(rgb(t.hover))))
+                .child(scope.label())
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    if this.palette_search_scope != scope {
+                        this.palette_search_scope = scope;
+                        this.refresh_palette(cx);
+                    }
+                }))
+                .into_any_element()
+        })
+        .collect();
+        let sort_controls: Vec<AnyElement> = [
+            PaletteSearchSort::Relevance,
+            PaletteSearchSort::Kind,
+            PaletteSearchSort::Modified,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, sort)| {
+            let active = self.palette_search_sort == sort;
+            div()
+                .id(("palette-sort", i))
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .text_xs()
+                .text_color(rgb(if active { t.text } else { t.text_muted }))
+                .when(active, |chip| chip.bg(rgb(t.selected)))
+                .when(!active, |chip| chip.hover(|chip| chip.bg(rgb(t.hover))))
+                .child(sort.label())
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    if this.palette_search_sort != sort {
+                        this.palette_search_sort = sort;
+                        this.refresh_palette(cx);
+                    }
+                }))
+                .into_any_element()
+        })
+        .collect();
 
         let panel = div()
             .w_full()
@@ -7080,7 +8161,41 @@ impl Shuffle {
                     .border_b_1()
                     .border_color(rgb(t.border_strong))
                     .child(div().flex_none().text_color(rgb(t.accent)).child("›"))
-                    .child(input),
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_w_0()
+                            .child(input)
+                            .children(self.ime_anchor(ImeTarget::Palette, cx)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .px_3()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(rgb(t.border))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(div().text_xs().text_color(rgb(t.text_dim)).child("范围"))
+                            .children(scope_controls),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(div().text_xs().text_color(rgb(t.text_dim)).child("排列"))
+                            .children(sort_controls),
+                    ),
             )
             // Scrollable, height-capped results with a scroll indicator.
             .child(
@@ -7116,9 +8231,9 @@ impl Shuffle {
                     .text_xs()
                     .text_color(rgb(t.text_dim))
                     .child(palette_hint("↩", enter_label))
-                    .when(has_actions, |f| f.child(palette_hint("⌘K", "Actions")))
-                    .child(palette_hint("↑↓", "Navigate"))
-                    .child(palette_hint("esc", "Close")),
+                    .when(has_actions, |f| f.child(palette_hint("⌘K", "操作")))
+                    .child(palette_hint("↑↓", "导航"))
+                    .child(palette_hint("esc", "关闭")),
             );
 
         // Wrapper: positions the palette and hosts the ⌘K dropdown OUTSIDE the
@@ -7295,6 +8410,7 @@ impl Shuffle {
             tab.content_for = None;
             tab.selection.clear();
             tab.anchor = None;
+            tab.selection_anchor = None;
             tab.col_chain.clear();
             tab.col_active = 0;
         }
@@ -7561,12 +8677,6 @@ impl Shuffle {
             _ => {
                 if cmd {
                     return; // leave other Cmd-combos alone
-                }
-                if let Some(ch) = ks.key_char.as_ref() {
-                    if !ch.is_empty() && !ch.chars().any(char::is_control) {
-                        self.path_insert(pane, ch);
-                        cx.notify();
-                    }
                 }
             }
         }
@@ -7906,14 +9016,6 @@ impl Shuffle {
                 if cmd {
                     return;
                 }
-                if let Some(ch) = ks.key_char.as_ref() {
-                    if !ch.is_empty() && !ch.chars().any(char::is_control) {
-                        self.find_insert(pane, ch);
-                        self.recompute_find(pane);
-                        self.update_content_search(pane, cx);
-                        cx.notify();
-                    }
-                }
             }
         }
     }
@@ -8050,7 +9152,9 @@ impl Shuffle {
         cx.notify();
         self.prewarm_icons(cx);
         // If this tab only got the fast pass, finish loading its metadata.
-        if self.tab(pane).entries.iter().any(|e| !e.loaded) {
+        if self.tab(pane).loaded_show_hidden != prefs().show_hidden
+            || self.tab(pane).entries.iter().any(|e| !e.loaded)
+        {
             self.reload_pane(pane, cx);
         }
     }
@@ -8211,6 +9315,7 @@ impl Shuffle {
             let tab = self.tab_mut(pane);
             tab.selection.clear();
             tab.selection.insert(path.clone());
+            tab.selection_anchor = Some(path.clone());
         }
         cx.notify();
         self.focus_entry(pane, path, cx);
@@ -8220,19 +9325,28 @@ impl Shuffle {
     fn toggle_entry(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
         self.active_pane = pane;
         self.rename = None;
-        let now_selected = {
+        let (now_selected, next_focus) = {
             let tab = self.tab_mut(pane);
             if tab.selection.contains(&path) {
                 tab.selection.remove(&path);
-                false
+                let next = tab.selection.iter().next().cloned();
+                if tab.selection_anchor.as_ref() == Some(&path) {
+                    tab.selection_anchor = next.clone();
+                }
+                (false, next)
             } else {
                 tab.selection.insert(path.clone());
-                true
+                tab.selection_anchor = Some(path.clone());
+                (true, Some(path.clone()))
             }
         };
         cx.notify();
         if now_selected {
             self.focus_entry(pane, path, cx);
+        } else if let Some(next) = next_focus {
+            self.focus_entry(pane, next, cx);
+        } else {
+            self.tab_mut(pane).anchor = None;
         }
     }
 
@@ -8241,22 +9355,36 @@ impl Shuffle {
         self.active_pane = pane;
         self.rename = None;
         let paths = self.display_paths(pane);
-        let to = paths.iter().position(|p| p == &path);
-        let from = self
-            .tab(pane)
-            .anchor
-            .as_ref()
-            .and_then(|a| paths.iter().position(|p| p == a));
-        let sel: HashSet<PathBuf> = match (from, to) {
-            (Some(a), Some(b)) => {
-                let (lo, hi) = (a.min(b), a.max(b));
-                paths[lo..=hi].iter().cloned().collect()
+        self.range_select_ordered(pane, path, &paths, cx);
+    }
+
+    /// Select a contiguous range in a supplied display order. Column view uses
+    /// the order of its active column; the other views use `display_paths`.
+    fn range_select_ordered(
+        &mut self,
+        pane: usize,
+        path: PathBuf,
+        paths: &[PathBuf],
+        cx: &mut Context<Self>,
+    ) {
+        let sel = contiguous_selection(
+            paths,
+            self.tab(pane).selection_anchor.as_deref(),
+            &path,
+        );
+        {
+            let tab = self.tab_mut(pane);
+            tab.selection = sel;
+            if tab
+                .selection_anchor
+                .as_ref()
+                .is_none_or(|anchor| !paths.contains(anchor))
+            {
+                tab.selection_anchor = Some(path.clone());
             }
-            _ => std::iter::once(path.clone()).collect(),
-        };
-        self.tab_mut(pane).selection = sel;
+        }
         cx.notify();
-        // Keep the existing anchor; just refresh the inspector to the clicked one.
+        // Keep the stable selection anchor; let the inspector follow the click.
         self.focus_entry(pane, path, cx);
     }
 
@@ -8294,6 +9422,7 @@ impl Shuffle {
             let tab = self.tab_mut(pane);
             tab.selection.clear();
             tab.anchor = None;
+            tab.selection_anchor = None;
         }
         self.marquee = Some((pane, (x, y), (x, y)));
         cx.notify();
@@ -8362,6 +9491,7 @@ impl Shuffle {
                     .rev()
                     .find(|p| self.tab(pane).selection.contains(p));
                 if let Some(p) = last {
+                    self.tab_mut(pane).selection_anchor = Some(p.clone());
                     self.focus_entry(pane, p, cx);
                 }
             }
@@ -8535,6 +9665,28 @@ impl Shuffle {
     ) {
         self.active_pane = pane;
         self.term_focused = false;
+        let mods = ev.modifiers();
+        let dir = if col_index == 0 {
+            self.tab(pane).current_dir.clone()
+        } else {
+            self.tab(pane)
+                .col_chain
+                .get(col_index - 1)
+                .cloned()
+                .unwrap_or_else(|| self.tab(pane).current_dir.clone())
+        };
+        let order = column_entries(&dir, prefs().show_hidden)
+            .into_iter()
+            .map(|entry| dir.join(entry.name))
+            .collect::<Vec<_>>();
+        if mods.platform {
+            self.toggle_entry(pane, target, cx);
+            return;
+        }
+        if mods.shift {
+            self.range_select_ordered(pane, target, &order, cx);
+            return;
+        }
         if is_dir {
             if ev.click_count() >= 2 {
                 // Double-click drills in as the new root.
@@ -8545,8 +9697,9 @@ impl Shuffle {
             tab.col_chain.truncate(col_index);
             tab.col_chain.push(target.clone());
             tab.selection.clear();
-            tab.selection.insert(target);
-            tab.anchor = None;
+            tab.selection.insert(target.clone());
+            tab.selection_anchor = Some(target.clone());
+            tab.anchor = Some(target);
             cx.notify();
         } else {
             {
@@ -8554,6 +9707,7 @@ impl Shuffle {
                 tab.col_chain.truncate(col_index);
                 tab.selection.clear();
                 tab.selection.insert(target.clone());
+                tab.selection_anchor = Some(target.clone());
             }
             if ev.click_count() >= 2 {
                 self.open_path(pane, target, false, cx);
@@ -8610,6 +9764,7 @@ impl Shuffle {
             let tab = self.tab_mut(pane);
             tab.selection.clear();
             tab.selection.insert(target.clone());
+            tab.selection_anchor = Some(target.clone());
         }
         // Keep the row/cell visible (List uses a ".." offset; Icons rows of N).
         let view = self.tab(pane).view;
@@ -8656,7 +9811,7 @@ impl Shuffle {
 
         // Up / down within column k.
         let dir = dirs[k].clone();
-        let entries = column_entries(&dir);
+        let entries = column_entries(&dir, prefs().show_hidden);
         if entries.is_empty() {
             return;
         }
@@ -8676,7 +9831,7 @@ impl Shuffle {
     /// Select entry `idx` in column `k` of the Column view (keyboard-driven).
     fn column_set(&mut self, pane: usize, k: usize, dirs: &[PathBuf], idx: usize, cx: &mut Context<Self>) {
         let dir = dirs[k].clone();
-        let entries = column_entries(&dir);
+        let entries = column_entries(&dir, prefs().show_hidden);
         let Some(e) = entries.get(idx) else { return };
         let target = dir.join(&e.name);
         let is_dir = e.is_dir;
@@ -8689,6 +9844,7 @@ impl Shuffle {
             tab.col_active = k;
             tab.selection.clear();
             tab.selection.insert(target.clone());
+            tab.selection_anchor = Some(target.clone());
         }
         cx.notify();
         self.focus_entry(pane, target, cx);
@@ -9135,7 +10291,7 @@ impl Shuffle {
             None => (cwd.clone(), last.clone()),
         };
 
-        let mut cands: Vec<(String, bool)> = list_dir_names(&base)
+        let mut cands: Vec<(String, bool)> = list_dir_names(&base, prefs().show_hidden)
             .into_iter()
             .filter(|(n, _)| n.to_lowercase().starts_with(&partial.to_lowercase()))
             .collect();
@@ -9195,12 +10351,6 @@ impl Shuffle {
             _ => {
                 if cmd {
                     return;
-                }
-                if let Some(ch) = ks.key_char.as_ref() {
-                    if !ch.is_empty() && !ch.chars().any(char::is_control) {
-                        self.term_input.push_str(ch);
-                        cx.notify();
-                    }
                 }
             }
         }
@@ -9272,6 +10422,7 @@ impl Shuffle {
                 .child(div().flex_none().text_color(rgb(t.accent)).child(format!("{cwd} ❯")))
                 .child(
                     div()
+                        .relative()
                         .flex_1()
                         .min_w_0()
                         .child(if self.term_input.is_empty() && !focused {
@@ -9280,13 +10431,14 @@ impl Shuffle {
                             format!("{}\u{2502}", self.term_input)
                         } else {
                             self.term_input.clone()
-                        }),
+                        })
+                        .children(self.ime_anchor(ImeTarget::Terminal, cx)),
                 ),
         )
     }
 
     /// The floating filter box, anchored bottom-right while find is active.
-    fn render_find_box(&self, pane: usize, query: &str) -> impl IntoElement {
+    fn render_find_box(&self, pane: usize, query: &str, cx: &Context<Self>) -> impl IntoElement {
         let t = theme();
         let tab = self.tab(pane);
         let count = tab.find_results.len();
@@ -9352,7 +10504,12 @@ impl Shuffle {
                     .text_color(rgb(if filtered { t.accent } else { t.text_muted }))
                     .child("Filter"),
             )
-            .child(field)
+            .child(
+                div()
+                    .relative()
+                    .child(field)
+                    .children(self.ime_anchor(ImeTarget::Find(pane), cx)),
+            )
             .child(
                 div()
                     .flex_none()
@@ -9372,7 +10529,7 @@ impl Shuffle {
     fn render_filter_box(&self, pane: usize, cx: &Context<Self>) -> AnyElement {
         let t = theme();
         match self.tab(pane).find_query.clone() {
-            Some(q) => self.render_find_box(pane, &q).into_any_element(),
+            Some(q) => self.render_find_box(pane, &q, cx).into_any_element(),
             // The always-on pill can be hidden in Settings; "/" still opens it.
             None if !prefs().show_filter_button => gpui::Empty.into_any_element(),
             None => div()
@@ -9598,14 +10755,6 @@ impl Shuffle {
                 if cmd {
                     return;
                 }
-                if let Some(ch) = ks.key_char.as_ref() {
-                    if !ch.is_empty() && !ch.chars().any(char::is_control) {
-                        if let Some(s) = self.group_dialog.as_mut() {
-                            s.push_str(ch);
-                        }
-                        cx.notify();
-                    }
-                }
             }
         }
     }
@@ -9670,10 +10819,20 @@ impl Shuffle {
             return;
         }
         self.waterfall_pending.insert(dir.clone());
+        let show_hidden = prefs().show_hidden;
         cx.spawn(async move |this, cx| {
             let d = dir.clone();
-            let (subs, mtime) = cx.background_spawn(async move { read_subdirs(&d) }).await;
+            let (subs, mtime) = cx
+                .background_spawn(async move { read_subdirs(&d, show_hidden) })
+                .await;
             let _ = this.update(cx, |this, cx| {
+                // A preference toggle may have cleared the cache while this
+                // read was in flight. Do not reinsert results from the old
+                // visibility mode.
+                if prefs().show_hidden != show_hidden {
+                    this.waterfall_pending.remove(&dir);
+                    return;
+                }
                 if let Some(m) = mtime {
                     this.waterfall_mtime.insert(dir.clone(), m);
                 }
@@ -10225,7 +11384,7 @@ impl Shuffle {
         let can_fwd = tab.hist_pos + 1 < tab.history.len();
 
         let content: AnyElement = if tab.editing_path.is_some() {
-            self.render_path_editor(pane).into_any_element()
+            self.render_path_editor(pane, cx).into_any_element()
         } else {
             self.render_breadcrumb(pane, cx).into_any_element()
         };
@@ -10410,7 +11569,7 @@ impl Shuffle {
     }
 
     /// The editable address-bar field shown in edit mode.
-    fn render_path_editor(&self, pane: usize) -> impl IntoElement {
+    fn render_path_editor(&self, pane: usize, cx: &Context<Self>) -> impl IntoElement {
         let t = theme();
         let tab = self.tab(pane);
         let text = tab.editing_path.clone().unwrap_or_default();
@@ -10446,6 +11605,7 @@ impl Shuffle {
         };
 
         div()
+            .relative()
             .flex_1()
             .min_w_0()
             .flex()
@@ -10458,6 +11618,7 @@ impl Shuffle {
             .border_color(rgb(t.accent))
             .text_color(rgb(t.text))
             .child(field)
+            .children(self.ime_anchor(ImeTarget::Path(pane), cx))
     }
 
     /// The canvas: one full-width pane, or two panes split by a draggable
@@ -10873,6 +12034,7 @@ impl Shuffle {
                                 items.push(
                                     file_row(
                                         "..",
+                                        "..",
                                         true,
                                         0,
                                         None,
@@ -10885,6 +12047,7 @@ impl Shuffle {
                                         true,        // accepts drops (move into parent)
                                         this.drop_hover == Some((pane, Some(ix))),
                                         None,        // never renamed
+                                        None,        // no inline IME field
                                         cx.listener({
                                             let parent = parent.clone();
                                             move |this, _: &ClickEvent, _, cx| {
@@ -10923,6 +12086,12 @@ impl Shuffle {
                             };
                             let entry = &tab.entries[entry_ix];
                             let name = entry.name.clone();
+                            let display_name = ellipsize_list_name(
+                                &name,
+                                widths.name - ICON_W - NAME_LABEL_INSET,
+                                _window,
+                                cx,
+                            );
                             let is_dir = entry.is_dir;
                             let entry_size = entry.size;
                             let modified = entry.modified;
@@ -10938,6 +12107,9 @@ impl Shuffle {
                                 .as_ref()
                                 .filter(|r| r.path == target)
                                 .map(|r| (r.text.clone(), r.cursor, r.anchor, this.rename_error().is_some()));
+                            let rename_ime_anchor = rename_text
+                                .as_ref()
+                                .and_then(|_| this.ime_anchor(ImeTarget::Rename, cx));
                             // Don't drag the row while it's being renamed.
                             let drag_target = if rename_text.is_some() {
                                 None
@@ -10949,6 +12121,7 @@ impl Shuffle {
                             items.push(
                                 file_row(
                                     &name,
+                                    &display_name,
                                     is_dir,
                                     entry_size,
                                     modified,
@@ -10961,6 +12134,7 @@ impl Shuffle {
                                     is_dir,            // folders accept drops
                                     this.drop_hover == Some((pane, Some(ix))),
                                     rename_text,       // editable name when renaming
+                                    rename_ime_anchor,
                                     cx.listener(move |this, ev: &ClickEvent, _, cx| {
                                         // Cmd/Shift extend the selection; otherwise
                                         // folders open and files select / double-open.
@@ -11117,12 +12291,13 @@ impl Shuffle {
 
         let mut cols: Vec<AnyElement> = Vec::new();
         for (i, dir) in dirs.iter().enumerate() {
-            let entries = column_entries(dir);
+            let entries = column_entries(dir, prefs().show_hidden);
             let next_dir = dirs.get(i + 1).cloned();
             let mut rows: Vec<AnyElement> = Vec::new();
             for e in &entries {
                 let target = dir.join(&e.name);
-                let selected = next_dir.as_deref() == Some(target.as_path())
+                let selected = tab.selection.contains(&target)
+                    || next_dir.as_deref() == Some(target.as_path())
                     || anchor.as_deref() == Some(target.as_path());
                 let ctx_active = self.is_ctx_target(&target);
                 rows.push(column_row(pane, i, &e.name, target, e.is_dir, selected, ctx_active, cx));
@@ -11184,10 +12359,12 @@ impl Shuffle {
         let mut strip: Vec<AnyElement> = Vec::new();
         for entry in tab.entries.iter().take(400) {
             let name = entry.name.clone();
+            let display_name = single_line_name(&name);
             let is_dir = entry.is_dir;
             let target = pane_dir.join(&name);
             let selected = tab.selection.contains(&target);
             let nav_t = target.clone();
+            let press_t = target.clone();
             strip.push(
                 div()
                     .id(SharedString::from(format!("film:{}", target.to_string_lossy())))
@@ -11202,14 +12379,29 @@ impl Shuffle {
                     .cursor_pointer()
                     .when(selected, |s| s.bg(rgb(t.selected)))
                     .hover(|s| s.bg(rgb(t.hover)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                            let (x, y) = (
+                                f64::from(ev.position.x) as f32,
+                                f64::from(ev.position.y) as f32,
+                            );
+                            this.drag_candidate = Some((pane, press_t.clone(), (x, y)));
+                            cx.stop_propagation();
+                        }),
+                    )
                     .child(icon_element_sized(&target, is_dir, 44.0))
-                    .child(div().w_full().truncate().text_xs().text_color(rgb(t.text_muted)).child(name))
+                    .child(
+                        div()
+                            .w_full()
+                            .truncate()
+                            .whitespace_nowrap()
+                            .text_xs()
+                            .text_color(rgb(t.text_muted))
+                            .child(display_name),
+                    )
                     .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
-                        if ev.click_count() >= 2 {
-                            this.open_path(pane, nav_t.clone(), is_dir, cx);
-                        } else {
-                            this.select_entry(pane, nav_t.clone(), cx);
-                        }
+                        this.click_entry(pane, nav_t.clone(), is_dir, ev, cx);
                     }))
                     .into_any_element(),
             );
@@ -11306,6 +12498,12 @@ impl Shuffle {
             .child(header_cell(pane, "Size", w.size, Column::Size, SortKey::Size, 0.0, true, key, asc, cx))
             // Slack space after the last column.
             .child(div().flex_1())
+    }
+}
+
+impl Drop for Shuffle {
+    fn drop(&mut self) {
+        self.close_quick_look();
     }
 }
 
@@ -11452,11 +12650,18 @@ impl Render for Shuffle {
                     .items_center()
                     .gap_2()
                     .px_4()
-                    .py_1p5()
+                    .py_2()
                     .bg(rgb(0xef4444))
                     .text_color(rgb(0xffffff))
                     .child(div().flex_none().child("⚠"))
-                    .child(div().flex_1().min_w_0().truncate().child(err))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_normal()
+                            .line_clamp(3)
+                            .child(err),
+                    )
                     .child(
                         div()
                             .id("sftp-err-dismiss")
@@ -11509,6 +12714,103 @@ impl Render for Shuffle {
             root = root.child(fps_overlay());
         }
         root
+    }
+}
+
+impl EntityInputHandler for Shuffle {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let target = self.ime_target()?;
+        let text = self.ime_text(target)?;
+        let range = utf16_range_bytes(text, range_utf16);
+        *adjusted_range = Some(byte_range_utf16(text, range.clone()));
+        Some(text[range].to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let target = self.ime_target()?;
+        let text = self.ime_text(target)?;
+        let (range, reversed) = self.ime_selection(target)?;
+        Some(UTF16Selection {
+            range: byte_range_utf16(text, range),
+            reversed,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        let (target, range) = self.ime_marked.as_ref()?;
+        if self.ime_target() != Some(*target) {
+            return None;
+        }
+        self.ime_text(*target)
+            .map(|text| byte_range_utf16(text, range.clone()))
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        if self
+            .ime_marked
+            .as_ref()
+            .is_some_and(|(target, _)| self.ime_target() == Some(*target))
+        {
+            self.ime_marked = None;
+        }
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ime_replace(range_utf16, text, None, false, cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        selected_utf16: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ime_replace(range_utf16, text, selected_utf16, true, cx);
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        self.ime_target().map(|_| element_bounds)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: gpui::Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let target = self.ime_target()?;
+        let text = self.ime_text(target)?;
+        let (selection, _) = self.ime_selection(target)?;
+        Some(byte_utf16(text, selection.end))
     }
 }
 
@@ -11808,7 +13110,7 @@ fn open_settings_window(cx: &mut App) {
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitlebarOptions {
-                title: Some("Settings".into()),
+                title: Some("设置".into()),
                 ..Default::default()
             }),
             ..Default::default()
@@ -11869,14 +13171,36 @@ fn ctx_separator() -> impl IntoElement {
     div().my_1().mx_2().h(px(1.0)).bg(rgb(theme().border_strong))
 }
 
+/// One visual context-menu level. Root and hovered submenu are laid out next
+/// to each other so the pointer can travel directly into the secondary menu.
+fn ctx_menu_panel(items: Vec<AnyElement>) -> AnyElement {
+    div()
+        .min_w(px(200.0))
+        .py_1()
+        .bg(menu_style().bg_rgba())
+        .text_color(rgb(menu_style().text))
+        .text_size(px(menu_style().font_px))
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(theme().border_strong))
+        .shadow_lg()
+        // Clicks inside either level shouldn't close via the backdrop.
+        .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| cx.stop_propagation())
+        .children(items)
+        .into_any_element()
+}
+
 /// A context-menu row that opens a submenu (shows a trailing "›").
 fn ctx_parent(
     label: &'static str,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    view: MenuView,
+    submenu: Option<AnyElement>,
+    cx: &Context<Shuffle>,
 ) -> impl IntoElement {
     let t = theme();
     div()
         .id(label)
+        .relative()
         .flex()
         .items_center()
         .justify_between()
@@ -11890,7 +13214,23 @@ fn ctx_parent(
         .hover(|s| s.bg(rgb(t.selected)))
         .child(label)
         .child(div().flex_none().text_color(rgb(t.text_dim)).child("›"))
-        .on_click(on_click)
+        .on_hover(cx.listener(move |this, hovering: &bool, _, cx| {
+            if *hovering {
+                this.set_menu_view(view, cx);
+            }
+        }))
+        // Keep click-to-open for accessibility and slower pointer workflows.
+        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            this.set_menu_view(view, cx);
+        }))
+        .children(submenu.map(|submenu| {
+            div()
+                .absolute()
+                .left(relative(1.0))
+                .top_0()
+                .ml(px(4.0))
+                .child(submenu)
+        }))
 }
 
 /// An app row in the "Open With" submenu (dynamic label, unique id).
@@ -12211,6 +13551,453 @@ fn unique_child(dir: &Path, base: &str) -> PathBuf {
     path
 }
 
+/// Publish paths using NSPasteboard's file-URL representation rather than as
+/// plain text. This is the representation Finder expects for copying files.
+fn write_file_clipboard(paths: &[PathBuf]) -> bool {
+    let urls = paths
+        .iter()
+        .filter_map(|path| path.to_str())
+        .map(|path| NSURL::fileURLWithPath(&NSString::from_str(path)))
+        .collect::<Vec<_>>();
+    if urls.is_empty() {
+        return false;
+    }
+    let objects = urls
+        .into_iter()
+        .map(ProtocolObject::<dyn NSPasteboardWriting>::from_retained)
+        .collect::<Vec<_>>();
+    let objects = NSArray::from_retained_slice(&objects);
+    let pasteboard = NSPasteboard::generalPasteboard();
+    pasteboard.clearContents();
+    pasteboard.writeObjects(&objects)
+}
+
+/// Read file URLs copied by Shuffle, Finder, or another macOS application.
+/// Ordinary text containing a path is intentionally not treated as a file.
+fn read_file_clipboard() -> Vec<PathBuf> {
+    let classes = NSArray::from_slice(&[NSURL::class()]);
+    let pasteboard = NSPasteboard::generalPasteboard();
+    let Some(objects) = (unsafe { pasteboard.readObjectsForClasses_options(&classes, None) }) else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    for index in 0..objects.count() {
+        let object = objects.objectAtIndex(index);
+        let Some(url) = object.downcast_ref::<NSURL>() else {
+            continue;
+        };
+        if !url.isFileURL() {
+            continue;
+        }
+        if let Some(path) = url.path() {
+            paths.push(PathBuf::from(path.to_string()));
+        }
+    }
+    paths
+}
+
+/// Pick a non-destructive destination for a pasted file. A collision (including
+/// pasting back into the source folder) creates a Finder-style “copy” name.
+fn paste_destination(source: &Path, dest_dir: &Path) -> Option<PathBuf> {
+    let name = source.file_name()?;
+    let direct = dest_dir.join(name);
+    if direct != source && !direct.exists() {
+        return Some(direct);
+    }
+    let stem = source
+        .file_stem()
+        .map(|part| part.to_string_lossy().into_owned())
+        .unwrap_or_else(|| name.to_string_lossy().into_owned());
+    let base = match source.extension() {
+        Some(extension) => format!("{stem} copy.{}", extension.to_string_lossy()),
+        None => format!("{stem} copy"),
+    };
+    Some(unique_child(dest_dir, &base))
+}
+
+/// Re-read file URLs from the live native drag pasteboard and activate any
+/// temporary security-scoped grants attached by the source application. The
+/// returned URLs must stay alive until copying finishes, then be stopped.
+fn begin_external_drop_access(paths: &[PathBuf]) -> Vec<ExternalDropUrl> {
+    use objc2::Message;
+    use objc2_app_kit::NSPasteboardNameDrag;
+
+    // Prefer the exact NSURLs captured from NSDraggingInfo by the native
+    // performDragOperation: bridge. Reconstructing NSURL from GPUI's PathBuf
+    // cannot reconstruct the sandbox/TCC grant carried by the original URL.
+    let wanted: HashSet<&Path> = paths.iter().map(PathBuf::as_path).collect();
+    let native_urls = ACTIVE_NATIVE_DROP_URLS.with(|active| {
+        active
+            .borrow()
+            .iter()
+            .filter(|scoped| {
+                scoped
+                    .url
+                    .path()
+                    .is_some_and(|path| wanted.contains(Path::new(&path.to_string())))
+            })
+            .map(|scoped| ExternalDropUrl {
+                url: scoped.url.clone(),
+                // The bridge owns and stops the access grant after GPUI's
+                // synchronous drop dispatch returns.
+                security_scope_started: false,
+            })
+            .collect::<Vec<_>>()
+    });
+    if !native_urls.is_empty() {
+        return native_urls;
+    }
+
+    let classes = NSArray::from_slice(&[NSURL::class()]);
+    let pasteboard = NSPasteboard::pasteboardWithName(unsafe { NSPasteboardNameDrag });
+    let Some(objects) = (unsafe { pasteboard.readObjectsForClasses_options(&classes, None) }) else {
+        return Vec::new();
+    };
+    let mut urls = Vec::new();
+    for index in 0..objects.count() {
+        let object = objects.objectAtIndex(index);
+        let Some(url) = object.downcast_ref::<NSURL>() else {
+            continue;
+        };
+        if !url.isFileURL() {
+            continue;
+        }
+        let Some(path) = url.path().map(|p| PathBuf::from(p.to_string())) else {
+            continue;
+        };
+        if wanted.contains(path.as_path()) {
+            let retained = url.retain();
+            let security_scope_started = unsafe { retained.startAccessingSecurityScopedResource() };
+            urls.push(ExternalDropUrl {
+                url: retained,
+                security_scope_started,
+            });
+        }
+    }
+    urls
+}
+
+/// Move a batch of local files into one directory without overwriting. Invalid
+/// self/descendant moves are skipped; the first real filesystem error is
+/// returned for the UI banner after the batch completes.
+fn move_paths_into(dest_dir: &Path, sources: &[PathBuf]) -> Result<(), String> {
+    if !dest_dir.is_dir() {
+        return Err(format!("移动失败：目标不是文件夹：{}", dest_dir.display()));
+    }
+    for source in sources {
+        let Some(name) = source.file_name() else { continue };
+        if source.parent() == Some(dest_dir) || dest_dir == source || dest_dir.starts_with(source) {
+            continue;
+        }
+        let destination = dest_dir.join(name);
+        if destination.exists() {
+            return Err(format!("移动失败：目标位置已存在“{}”", single_line_name(&name.to_string_lossy())));
+        }
+        let status = Command::new("mv")
+            .arg(source)
+            .arg(&destination)
+            .status()
+            .map_err(|error| {
+                format!(
+                    "移动“{}”失败：{error}",
+                    single_line_name(&name.to_string_lossy())
+                )
+            })?;
+        if !status.success() {
+            return Err(format!(
+                "移动“{}”失败（退出码 {}）",
+                single_line_name(&name.to_string_lossy()),
+                status.code().unwrap_or(-1)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Copy files received from another application into a local folder. WeChat
+/// drag paths live in a protected temporary container and must never be moved
+/// out of it. NSFileManager runs inside Shuffle, so it can use the temporary
+/// drag permission consumed by [`begin_external_drop_access`].
+fn copy_paths_into(
+    dest_dir: &Path,
+    sources: &[PathBuf],
+    scoped_urls: &[ExternalDropUrl],
+) -> Result<(), String> {
+    if !dest_dir.is_dir() {
+        return Err(format!("复制失败：目标不是文件夹：{}", dest_dir.display()));
+    }
+    for source in sources {
+        let Some(name) = source.file_name() else { continue };
+        if !source.exists() {
+            return Err(format!(
+                "复制失败：来源文件“{}”已经失效，请从原应用重新拖入",
+                single_line_name(&name.to_string_lossy())
+            ));
+        }
+        if source.is_dir() && dest_dir.starts_with(source) {
+            continue;
+        }
+        let destination = paste_destination(source, dest_dir)
+            .ok_or_else(|| "复制失败：无法生成目标文件名".to_string())?;
+        let destination_url =
+            NSURL::fileURLWithPath(&NSString::from_str(&destination.to_string_lossy()));
+        let original_url = scoped_urls.iter().find(|scoped| {
+            scoped
+                .url
+                .path()
+                .is_some_and(|path| Path::new(&path.to_string()) == source)
+        });
+        let copy_result = if let Some(scoped) = original_url {
+            NSFileManager::defaultManager()
+                .copyItemAtURL_toURL_error(&scoped.url, &destination_url)
+        } else {
+            let source_url =
+                NSURL::fileURLWithPath(&NSString::from_str(&source.to_string_lossy()));
+            NSFileManager::defaultManager()
+                .copyItemAtURL_toURL_error(&source_url, &destination_url)
+        };
+        copy_result
+            .map_err(|error| {
+                format!(
+                    "复制“{}”失败：{}",
+                    single_line_name(&name.to_string_lossy()),
+                    single_line_name(&error.localizedDescription().to_string())
+                )
+            })?;
+    }
+    Ok(())
+}
+
+/// Ask macOS to authorize the exact protected files the person just dragged.
+///
+/// WeChat 4.x exposes only a delayed `public.file-url` whose target is inside
+/// its TCC-protected container. An ad-hoc development build cannot reliably
+/// receive the normal cross-app-data prompt, even with Full Disk Access. The
+/// standard open panel is Apple's supported user-intent path: it grants only
+/// the file(s) the person confirms, then we immediately copy them into the
+/// already chosen Shuffle folder.
+/// The panel is modeless. Calling `runModal` from GPUI's drop listener starts a
+/// nested AppKit event loop while GPUI still holds its App borrow; an input
+/// source notification can then re-enter GPUI and panic with `already borrowed`.
+fn begin_protected_drop_confirmation(
+    dest_dir: PathBuf,
+    sources: Vec<PathBuf>,
+    on_complete: impl FnOnce(Result<(), String>) + 'static,
+) {
+    let Some(mtm) = objc2::MainThreadMarker::new() else {
+        on_complete(Err("接收拖入文件失败：文件授权窗口只能在主线程打开".to_string()));
+        return;
+    };
+    let panel = NSOpenPanel::openPanel(mtm);
+    panel.setTitle(Some(&NSString::from_str("允许 Shuffle 接收拖入文件")));
+    panel.setMessage(Some(&NSString::from_str(
+        "源文件位于其他 App 的受保护目录。确认下方文件后，点“允许拖入”。",
+    )));
+    panel.setPrompt(Some(&NSString::from_str("允许拖入")));
+    panel.setCanChooseFiles(true);
+    panel.setCanChooseDirectories(true);
+    panel.setAllowsMultipleSelection(sources.len() > 1);
+
+    if let Some(first) = sources.first() {
+        if let Some(parent) = first.parent() {
+            let parent_url = NSURL::fileURLWithPath(&NSString::from_str(&parent.to_string_lossy()));
+            panel.setDirectoryURL(Some(&parent_url));
+        }
+        if let Some(name) = first.file_name() {
+            panel.setNameFieldStringValue(&NSString::from_str(&name.to_string_lossy()));
+        }
+    }
+
+    let on_complete = RefCell::new(Some(on_complete));
+    let callback_panel = panel.clone();
+    let completion: block2::RcBlock<dyn Fn(objc2_app_kit::NSModalResponse)> =
+        block2::RcBlock::new(move |response| {
+            let result = if response != NSModalResponseOK {
+                Err("已取消接收拖入文件".to_string())
+            } else {
+                let selected = callback_panel.URLs();
+                let mut selected_paths = Vec::with_capacity(selected.count());
+                let mut scoped_urls = Vec::with_capacity(selected.count());
+                for index in 0..selected.count() {
+                    let url = selected.objectAtIndex(index);
+                    let Some(path) = url.path().map(|path| PathBuf::from(path.to_string())) else {
+                        continue;
+                    };
+                    let security_scope_started =
+                        unsafe { url.startAccessingSecurityScopedResource() };
+                    selected_paths.push(path);
+                    scoped_urls.push(ExternalDropUrl {
+                        url,
+                        security_scope_started,
+                    });
+                }
+                if selected_paths.is_empty() {
+                    Err("接收拖入文件失败：没有选择文件".to_string())
+                } else {
+                    copy_paths_into(&dest_dir, &selected_paths, &scoped_urls)
+                }
+            };
+            if let Some(on_complete) = on_complete.borrow_mut().take() {
+                on_complete(result);
+            }
+        });
+    panel.beginWithCompletionHandler(&completion);
+}
+
+fn is_protected_app_container_path(path: &Path) -> bool {
+    let components = path.components().collect::<Vec<_>>();
+    components.windows(2).any(|pair| {
+        pair[0].as_os_str() == "Library" && pair[1].as_os_str() == "Containers"
+    })
+}
+
+/// Complete a file-promise drop after AppKit's operation queue has drained.
+/// Only files materialized inside our staging directory are accepted; then the
+/// existing collision-safe copy routine moves a copy into the visible folder.
+fn finish_file_promise_drop(
+    staging: &Path,
+    dest_dir: &Path,
+    delivered: &Arc<Mutex<Vec<PathBuf>>>,
+    callback_errors: &Arc<Mutex<Vec<String>>>,
+    expected_files: usize,
+) -> Result<(), String> {
+    let mut sources = delivered
+        .lock()
+        .map(|paths| paths.clone())
+        .unwrap_or_default();
+    if let Ok(entries) = fs::read_dir(staging) {
+        sources.extend(entries.filter_map(Result::ok).map(|entry| entry.path()));
+    }
+    sources.retain(|path| path.starts_with(staging) && path.exists());
+    sources.sort();
+    sources.dedup();
+
+    let errors = callback_errors
+        .lock()
+        .map(|errors| errors.clone())
+        .unwrap_or_default();
+    let result = if sources.is_empty() {
+        let detail = errors
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "源应用没有交付文件，请在源应用中重新拖动".to_string());
+        Err(format!("接收拖入文件失败：{detail}"))
+    } else {
+        let received_files = sources.len();
+        copy_paths_into(dest_dir, &sources, &[]).and_then(|_| {
+            if received_files < expected_files {
+                if let Some(detail) = errors.first() {
+                    return Err(format!("部分拖入文件接收失败：{detail}"));
+                }
+            }
+            Ok(())
+        })
+    };
+    let _ = fs::remove_dir_all(staging);
+    result
+}
+
+#[cfg(test)]
+mod file_paste_tests {
+    use super::*;
+
+    #[test]
+    fn paste_keeps_name_when_destination_is_free() {
+        let source = PathBuf::from("/source/report.pdf");
+        let destination = paste_destination(&source, Path::new("/destination")).unwrap();
+        assert_eq!(destination, PathBuf::from("/destination/report.pdf"));
+    }
+
+    #[test]
+    fn paste_back_into_source_folder_uses_copy_name() {
+        let source = PathBuf::from("/folder/report.pdf");
+        let destination = paste_destination(&source, Path::new("/folder")).unwrap();
+        assert_eq!(destination, PathBuf::from("/folder/report copy.pdf"));
+    }
+
+    #[test]
+    fn external_drop_copy_preserves_source_and_avoids_overwrite() {
+        let root = std::env::temp_dir().join(format!(
+            "shuffle-drop-copy-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source_dir = root.join("wechat-temp");
+        let destination_dir = root.join("destination");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&destination_dir).unwrap();
+        let source = source_dir.join("微信文件.txt");
+        fs::write(&source, "from wechat").unwrap();
+        fs::write(destination_dir.join("微信文件.txt"), "existing").unwrap();
+
+        copy_paths_into(&destination_dir, std::slice::from_ref(&source), &[]).unwrap();
+
+        assert_eq!(fs::read_to_string(&source).unwrap(), "from wechat");
+        assert_eq!(fs::read_to_string(destination_dir.join("微信文件.txt")).unwrap(), "existing");
+        assert_eq!(
+            fs::read_to_string(destination_dir.join("微信文件 copy.txt")).unwrap(),
+            "from wechat"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn promised_drop_copies_from_staging_and_cleans_it_up() {
+        let root = std::env::temp_dir().join(format!(
+            "shuffle-promise-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let staging = root.join("staging");
+        let destination = root.join("destination");
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        let promised = staging.join("微信拖入文件.xlsx");
+        fs::write(&promised, "promised data").unwrap();
+        let delivered = Arc::new(Mutex::new(vec![promised]));
+        let errors = Arc::new(Mutex::new(Vec::new()));
+
+        finish_file_promise_drop(&staging, &destination, &delivered, &errors, 1).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination.join("微信拖入文件.xlsx")).unwrap(),
+            "promised data"
+        );
+        assert!(!staging.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn detects_only_app_container_paths_for_authorization_fallback() {
+        assert!(is_protected_app_container_path(Path::new(
+            "/Users/test/Library/Containers/com.tencent.xinWeChat/Data/file.xlsx"
+        )));
+        assert!(!is_protected_app_container_path(Path::new(
+            "/Users/test/Desktop/file.xlsx"
+        )));
+        assert!(!is_protected_app_container_path(Path::new(
+            "/Users/test/Library/Application Support/file.xlsx"
+        )));
+    }
+
+    /// Run manually on macOS when changing the AppKit pasteboard bridge. It is
+    /// ignored in the normal suite because it intentionally replaces the
+    /// user's system clipboard.
+    #[test]
+    #[ignore]
+    fn native_file_clipboard_round_trip() {
+        let source = std::env::current_dir().unwrap().join("Cargo.toml");
+        assert!(write_file_clipboard(std::slice::from_ref(&source)));
+        assert_eq!(read_file_clipboard(), vec![source]);
+    }
+}
+
 /// Move a path to the macOS Trash (recoverable). Returns whether it succeeded.
 fn trash_path(path: &Path) -> bool {
     let ns_path = NSString::from_str(&path.to_string_lossy());
@@ -12287,10 +14074,110 @@ fn empty_hint(text: &str) -> impl IntoElement {
         .child(text.to_string())
 }
 
+/// Produce a safe, single-line label for a filesystem name.
+///
+/// Unix filenames may legally contain newlines, tabs, and other control
+/// characters. Keep those bytes in paths and file operations, but never pass
+/// them directly to a one-row UI: an embedded line break can paint the label
+/// into an adjacent virtualized row. Runs in the middle become one space;
+/// leading/trailing runs disappear. A name made entirely of controls still
+/// gets a visible placeholder.
+fn single_line_name(name: &str) -> String {
+    let mut label = String::with_capacity(name.len());
+    let mut pending_separator = false;
+
+    for ch in name.chars() {
+        if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
+            pending_separator = true;
+            continue;
+        }
+
+        if pending_separator
+            && !label.is_empty()
+            && !label.chars().last().is_some_and(char::is_whitespace)
+            && !ch.is_whitespace()
+        {
+            label.push(' ');
+        }
+        pending_separator = false;
+        label.push(ch);
+    }
+
+    if label.is_empty() && !name.is_empty() {
+        "\u{2424}".to_string()
+    } else {
+        label
+    }
+}
+
+/// Rename text keeps one displayed character per source character so cursor
+/// and selection offsets stay valid, while hard line breaks cannot escape the
+/// fixed-height field.
+fn single_line_edit_segment(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod single_line_name_tests {
+    use super::{single_line_edit_segment, single_line_name};
+
+    #[test]
+    fn removes_trailing_controls_without_changing_the_real_name() {
+        let raw = "\u{534e}\u{6da6}\u{9879}\u{76ee}\n";
+        assert_eq!(single_line_name(raw), "\u{534e}\u{6da6}\u{9879}\u{76ee}");
+        assert_eq!(raw.chars().count(), 5);
+    }
+
+    #[test]
+    fn collapses_embedded_control_runs_to_one_separator() {
+        assert_eq!(single_line_name("alpha\r\n\tbeta\u{2028}gamma"), "alpha beta gamma");
+        assert_eq!(single_line_name("\n\t"), "\u{2424}");
+    }
+
+    #[test]
+    fn rename_segments_preserve_character_offsets() {
+        let raw = "a\r\n\tb";
+        let shown = single_line_edit_segment(raw);
+        assert_eq!(shown, "a   b");
+        assert_eq!(shown.chars().count(), raw.chars().count());
+    }
+}
+
 /// One clickable listing row in the main pane: icon · name · kind · date · size.
+///
+/// GPUI 0.2.2 does not consistently apply `text-overflow: ellipsis` to text in
+/// this fixed-width virtualized flex row. Shape the visible label with GPUI's
+/// own active font metrics first, while keeping the original name for actions
+/// and metadata.
+fn ellipsize_list_name(name: &str, max_width: f32, window: &Window, cx: &App) -> String {
+    let name = single_line_name(name);
+    let style = window.text_style();
+    let font_size = style.font_size.to_pixels(window.rem_size());
+    let mut runs = vec![style.to_run(name.len())];
+    let mut wrapper = cx.text_system().line_wrapper(style.font(), font_size);
+    wrapper
+        .truncate_line(
+            SharedString::from(name),
+            px(max_width.max(0.0)),
+            "…",
+            &mut runs,
+        )
+        .as_ref()
+        .to_string()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn file_row(
     name: &str,
+    display_name: &str,
     is_dir: bool,
     size: u64,
     modified: Option<SystemTime>,
@@ -12312,6 +14199,8 @@ fn file_row(
     // with (text, cursor char-index, selection-anchor char-index, invalid).
     // Invalid names render the field in red (the pane shows the reason).
     rename_text: Option<(String, usize, Option<usize>, bool)>,
+    // Paint-phase IME anchor for the inline rename field, when it is active.
+    ime_anchor: Option<AnyElement>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_right: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     on_drop_file: impl Fn(&ExternalPaths, &mut Window, &mut App) + 'static,
@@ -12324,13 +14213,25 @@ fn file_row(
     let kind = kind_label(name, is_dir);
     let name_color = if is_dir { t.accent } else { t.text };
     let meta_color = rgb(t.text_muted);
+    // Give GPUI a definite width for text measurement. Relying only on
+    // `flex_1().min_w_0()` here can leave text measurement unconstrained in a
+    // fixed-width flex cell, so long CJK names wrap and paint over the Kind
+    // column instead of receiving an ellipsis.
+    let name_label_w = (widths.name - ICON_W - NAME_LABEL_INSET).max(0.0);
     // The name element: an editable field while renaming, else the label.
     let name_el: AnyElement = match &rename_text {
         Some((txt, cursor, anchor, invalid)) => {
             let edge = if *invalid { RENAME_ERR_COLOR } else { t.accent };
             let field = div()
-                .flex_1()
+                .relative()
+                .flex_shrink_0()
+                .w(px(name_label_w))
+                .max_w(px(name_label_w))
+                .h_full()
+                .max_h(px(ROW_H))
                 .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
                 .px_1()
                 .rounded_sm()
                 .bg(rgb(t.bg))
@@ -12338,7 +14239,8 @@ fn file_row(
                 .border_color(rgb(edge))
                 .text_color(rgb(if *invalid { RENAME_ERR_COLOR } else { t.text }))
                 .flex()
-                .items_center();
+                .items_center()
+                .children(ime_anchor);
             let n = txt.chars().count();
             let cursor = (*cursor).min(n);
             let sel = anchor
@@ -12348,41 +14250,61 @@ fn file_row(
                 // Highlighted selection between the plain head and tail.
                 let (bl, bh) = (char_byte(txt, lo), char_byte(txt, hi));
                 field
-                    .child(div().flex_none().child(txt[..bl].to_string()))
+                    .child(div().flex_none().child(single_line_edit_segment(&txt[..bl])))
                     .child(
                         div()
                             .flex_none()
                             .bg(Theme::alpha(edge, 0x66))
                             .rounded_sm()
-                            .child(txt[bl..bh].to_string()),
+                            .child(single_line_edit_segment(&txt[bl..bh])),
                     )
-                    .child(div().flex_none().child(txt[bh..].to_string()))
+                    .child(div().flex_none().child(single_line_edit_segment(&txt[bh..])))
                     .into_any_element()
             } else {
                 // Static caret at the cursor position.
                 let b = char_byte(txt, cursor);
                 field
-                    .child(div().flex_none().child(txt[..b].to_string()))
+                    .child(div().flex_none().child(single_line_edit_segment(&txt[..b])))
                     .child(div().flex_none().w(px(1.5)).h(px(14.0)).bg(rgb(t.text)))
-                    .child(div().flex_none().child(txt[b..].to_string()))
+                    .child(div().flex_none().child(single_line_edit_segment(&txt[b..])))
                     .into_any_element()
             }
         }
         None => div()
-            .flex_1()
+            // Match GPUI's table-cell truncation pattern: a definite width on
+            // a shrink-disabled flex child. `flex_none` left text measurement
+            // at its max-content width here, so the Name cell's outer mask cut
+            // the glyphs before GPUI ever inserted an ellipsis.
+            .flex_shrink_0()
+            .w(px(name_label_w))
+            .max_w(px(name_label_w))
+            .h_full()
+            .max_h(px(ROW_H))
             .min_w_0()
-            .truncate()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .flex()
+            .items_center()
             .text_color(rgb(name_color))
-            .child(name.to_string())
+            .child(display_name.to_string())
             .into_any_element(),
     };
 
     div()
         .id(("row", key))
         .flex()
+        .flex_none()
         .items_center()
         .px_3()
         .h(px(ROW_H))
+        .min_h(px(ROW_H))
+        .max_h(px(ROW_H))
+        // Every list column is single-line. Put the constraint on the row so
+        // descendants cannot re-enable wrapping through an inherited default.
+        .whitespace_nowrap()
+        // A row is always one line high. This is a final paint boundary so a
+        // malformed/oversized child can never draw into the following row.
+        .overflow_hidden()
         .cursor_pointer()
         .when(selected, |s| s.bg(rgb(t.selected)))
         .when(ctx_active && !selected, |s| s.bg(rgb(t.hover)))
@@ -12401,6 +14323,12 @@ fn file_row(
             div()
                 .flex_none()
                 .w(px(widths.name))
+                .min_w_0()
+                .h_full()
+                .max_h(px(ROW_H))
+                // Clip at the column boundary as well as on the text itself;
+                // this prevents a long name from painting over Kind/Date.
+                .overflow_hidden()
                 .flex()
                 .items_center()
                 .gap_2()
@@ -12466,6 +14394,7 @@ fn icon_cell(
     cx: &Context<Shuffle>,
 ) -> AnyElement {
     let t = theme();
+    let display_name = single_line_name(&name);
     let press_t = target.clone();
     let drop_t = target.clone();
     let ctx_t = target.clone();
@@ -12523,9 +14452,10 @@ fn icon_cell(
             div()
                 .w_full()
                 .truncate()
+                .whitespace_nowrap()
                 .text_xs()
                 .text_color(rgb(if is_dir { t.accent } else { t.text }))
-                .child(name),
+                .child(display_name),
         )
         .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
             this.click_entry(pane, click_t.clone(), is_dir, ev, cx);
@@ -12563,7 +14493,9 @@ fn column_row(
     cx: &Context<Shuffle>,
 ) -> AnyElement {
     let t = theme();
+    let display_name = single_line_name(name);
     let icon = icon_element(&target, is_dir);
+    let press_t = target.clone();
     let click_t = target.clone();
     let ctx_t = target.clone();
     div()
@@ -12577,14 +14509,26 @@ fn column_row(
         .when(selected, |s| s.bg(rgb(t.selected)))
         .when(ctx_active && !selected, |s| s.bg(rgb(t.hover)))
         .hover(|s| s.bg(rgb(t.hover)))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                let (x, y) = (
+                    f64::from(ev.position.x) as f32,
+                    f64::from(ev.position.y) as f32,
+                );
+                this.drag_candidate = Some((pane, press_t.clone(), (x, y)));
+                cx.stop_propagation();
+            }),
+        )
         .child(div().flex_none().w(px(ICON_W)).flex().justify_center().child(icon))
         .child(
             div()
                 .flex_1()
                 .min_w_0()
                 .truncate()
+                .whitespace_nowrap()
                 .text_color(rgb(if is_dir { t.accent } else { t.text }))
-                .child(name.to_string()),
+                .child(display_name),
         )
         .when(is_dir, |r| {
             r.child(div().flex_none().text_color(rgb(t.text_dim)).child("›"))
@@ -12893,7 +14837,7 @@ fn sidebar_locations() -> (Vec<(String, PathBuf)>, Vec<(String, PathBuf)>) {
 /// List a folder's visible subdirectories (sorted case-insensitively) plus its
 /// current mtime. Used by the waterfall sidebar tree; runs off the main thread
 /// (may block on I/O). The mtime lets the watcher detect outside changes.
-fn read_subdirs(dir: &Path) -> (Vec<PathBuf>, Option<SystemTime>) {
+fn read_subdirs(dir: &Path, show_hidden: bool) -> (Vec<PathBuf>, Option<SystemTime>) {
     let mut out = Vec::new();
     if let Ok(rd) = fs::read_dir(dir) {
         for e in rd.flatten() {
@@ -12907,7 +14851,7 @@ fn read_subdirs(dir: &Path) -> (Vec<PathBuf>, Option<SystemTime>) {
                 .file_name()
                 .map(|n| n.to_string_lossy().starts_with('.'))
                 .unwrap_or(false);
-            if is_dir && !hidden {
+            if is_dir && (show_hidden || !hidden) {
                 out.push(p);
             }
         }
@@ -13563,11 +15507,16 @@ fn sftp_home(server: &SftpServer, use_system: bool) -> Result<String, String> {
 }
 
 /// List a remote directory, returning entries parsed from sftp's `ls -l`.
-fn sftp_list(server: &SftpServer, path: &str, use_system: bool) -> Result<Vec<Entry>, String> {
+fn sftp_list(
+    server: &SftpServer,
+    path: &str,
+    use_system: bool,
+    show_hidden: bool,
+) -> Result<Vec<Entry>, String> {
     // Quote the path so spaces work; sftp treats the argument as a glob-free path.
     let script = format!("ls -la \"{}\"", path.replace('"', ""));
     let out = sftp_batch(server, &script, use_system)?;
-    Ok(parse_sftp_ls(&out))
+    Ok(parse_sftp_ls(&out, show_hidden))
 }
 
 /// Create a remote directory.
@@ -13616,7 +15565,7 @@ fn sftp_touch(server: &SftpServer, path: &str, use_system: bool) -> Result<(), S
 /// `drwxr-xr-x  2 1000 1000  4096 Jul 30 10:00 name` — 8 fixed fields + name.
 /// The format is produced by the sftp client itself, so it's consistent across
 /// remote operating systems.
-fn parse_sftp_ls(out: &str) -> Vec<Entry> {
+fn parse_sftp_ls(out: &str, show_hidden: bool) -> Vec<Entry> {
     let mut entries = Vec::new();
     for line in out.lines() {
         let line = line.trim_end();
@@ -13645,6 +15594,9 @@ fn parse_sftp_ls(out: &str) -> Vec<Entry> {
             }
         }
         if name == "." || name == ".." || name.is_empty() {
+            continue;
+        }
+        if !show_hidden && is_hidden_name(&name) {
             continue;
         }
         entries.push(Entry {
@@ -13713,7 +15665,8 @@ fn load_sftp_servers() -> Vec<SftpServer> {
 // ----- native OS file drag-out (drag files into Finder / other apps) ---------
 
 define_class!(
-    // A minimal NSDraggingSource: it only needs to say the drag is a "copy".
+    // A minimal NSDraggingSource: moving within Shuffle should move files,
+    // while dragging out to Finder or another app remains a non-destructive copy.
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "ShuffleDragSource"]
@@ -13726,11 +15679,23 @@ define_class!(
         fn source_operation_mask(
             &self,
             _session: &NSDraggingSession,
-            _context: NSDraggingContext,
+            context: NSDraggingContext,
         ) -> NSDragOperation {
-            // Copy only: dragging out to another app never moves/deletes the
-            // original file.
-            NSDragOperation::Copy
+            if context == NSDraggingContext::WithinApplication {
+                NSDragOperation::Move
+            } else {
+                NSDragOperation::Copy
+            }
+        }
+
+        #[unsafe(method(draggingSession:endedAtPoint:operation:))]
+        fn dragging_session_ended(
+            &self,
+            _session: &NSDraggingSession,
+            _screen_point: objc2_foundation::NSPoint,
+            _operation: NSDragOperation,
+        ) {
+            SHUFFLE_FILE_DRAG_LIVE.store(false, Ordering::Relaxed);
         }
     }
 );
@@ -13755,6 +15720,204 @@ fn ns_view_ptr(window: &Window) -> Option<*mut std::ffi::c_void> {
     match handle.as_raw() {
         RawWindowHandle::AppKit(h) => Some(h.ns_view.as_ptr()),
         _ => None,
+    }
+}
+
+/// Retain the original file NSURLs carried by the live NSDraggingInfo. A plain
+/// path reconstructed later is not equivalent: it does not carry the temporary
+/// sandbox extension granted by the source app.
+unsafe fn urls_from_native_drag(dragging_info: *mut AnyObject) -> Vec<ExternalDropUrl> {
+    use objc2::Message;
+
+    if dragging_info.is_null() {
+        return Vec::new();
+    }
+    let pasteboard_ptr: *mut AnyObject = unsafe {
+        objc2::msg_send![dragging_info, draggingPasteboard]
+    };
+    if pasteboard_ptr.is_null() {
+        return Vec::new();
+    }
+    let pasteboard = unsafe { &*(pasteboard_ptr as *const NSPasteboard) };
+    let classes = NSArray::from_slice(&[NSURL::class()]);
+    let Some(objects) = (unsafe { pasteboard.readObjectsForClasses_options(&classes, None) }) else {
+        return Vec::new();
+    };
+    let mut urls = Vec::new();
+    for index in 0..objects.count() {
+        let object = objects.objectAtIndex(index);
+        let Some(url) = object.downcast_ref::<NSURL>() else {
+            continue;
+        };
+        if !url.isFileURL() {
+            continue;
+        }
+        let retained = url.retain();
+        let security_scope_started = unsafe { retained.startAccessingSecurityScopedResource() };
+        urls.push(ExternalDropUrl {
+            url: retained,
+            security_scope_started,
+        });
+    }
+    urls
+}
+
+/// Read all modern and legacy file promises from the live dragging pasteboard.
+/// AppKit wraps the legacy NSFilesPromisePboardType in NSFilePromiseReceiver as
+/// long as all of `readableDraggedTypes` have been registered on the window.
+unsafe fn promises_from_native_drag(
+    dragging_info: *mut AnyObject,
+) -> Vec<objc2::rc::Retained<NSFilePromiseReceiver>> {
+    if dragging_info.is_null() {
+        return Vec::new();
+    }
+    let pasteboard_ptr: *mut AnyObject = unsafe {
+        objc2::msg_send![dragging_info, draggingPasteboard]
+    };
+    if pasteboard_ptr.is_null() {
+        return Vec::new();
+    }
+    let pasteboard = unsafe { &*(pasteboard_ptr as *const NSPasteboard) };
+    let classes = NSArray::from_slice(&[NSFilePromiseReceiver::class()]);
+    let Some(objects) = (unsafe { pasteboard.readObjectsForClasses_options(&classes, None) }) else {
+        return Vec::new();
+    };
+    (0..objects.count())
+        .filter_map(|index| {
+            objects
+                .objectAtIndex(index)
+                .downcast::<NSFilePromiseReceiver>()
+                .ok()
+        })
+        .collect()
+}
+
+/// WeChat 4.x imports and publishes AppKit's legacy
+/// `NSFilesPromisePboardType`. That promise is resolved by asking the live
+/// NSDraggingInfo for the promised names and destination; it is not guaranteed
+/// to be bridged into NSFilePromiseReceiver by `readObjectsForClasses:`.
+unsafe fn legacy_promise_from_native_drag(
+    dragging_info: *mut AnyObject,
+) -> Option<LegacyFilePromise> {
+    use objc2::Message;
+
+    if dragging_info.is_null() {
+        return None;
+    }
+    let pasteboard_ptr: *mut AnyObject = unsafe {
+        objc2::msg_send![dragging_info, draggingPasteboard]
+    };
+    if pasteboard_ptr.is_null() {
+        return None;
+    }
+    let pasteboard = unsafe { &*(pasteboard_ptr as *const NSPasteboard) };
+    let has_legacy_promise = pasteboard.types().is_some_and(|types| {
+        (0..types.count()).any(|index| {
+            types.objectAtIndex(index).to_string() == "Apple files promise pasteboard type"
+        })
+    });
+    has_legacy_promise.then(|| LegacyFilePromise {
+        dragging_info: unsafe { (&*dragging_info).retain() },
+    })
+}
+
+/// GPUI 0.2.2's original implementation synchronously dispatches the drop into
+/// Shuffle. Wrap that one method so the source application's file authorization
+/// remains live for the entire copy, then release it immediately afterwards.
+unsafe extern "C-unwind" fn shuffle_perform_native_drop(
+    receiver: *mut AnyObject,
+    selector: Sel,
+    dragging_info: *mut AnyObject,
+) -> Bool {
+    let legacy_promise = unsafe { legacy_promise_from_native_drag(dragging_info) };
+    // File promises have priority. They let the source application write a
+    // fresh copy into a destination chosen by Shuffle and avoid opening the
+    // source app's TCC-protected container path altogether.
+    let promises = unsafe { promises_from_native_drag(dragging_info) };
+    let urls = if promises.is_empty() {
+        unsafe { urls_from_native_drag(dragging_info) }
+    } else {
+        Vec::new()
+    };
+    ACTIVE_NATIVE_FILE_PROMISES.with(|active| {
+        *active.borrow_mut() = promises;
+    });
+    ACTIVE_NATIVE_LEGACY_PROMISE.with(|active| {
+        *active.borrow_mut() = legacy_promise;
+    });
+    ACTIVE_NATIVE_DROP_URLS.with(|active| {
+        *active.borrow_mut() = urls;
+    });
+
+    let result = if let Some(original) = ORIGINAL_NATIVE_PERFORM_DROP.get() {
+        unsafe { original(receiver, selector, dragging_info) }
+    } else {
+        Bool::NO
+    };
+
+    // Dropping the originals stops only the grants that successfully started;
+    // this happens after copy_paths_into has returned.
+    ACTIVE_NATIVE_DROP_URLS.with(|active| active.borrow_mut().clear());
+    ACTIVE_NATIVE_FILE_PROMISES.with(|active| active.borrow_mut().clear());
+    ACTIVE_NATIVE_LEGACY_PROMISE.with(|active| active.borrow_mut().take());
+    result
+}
+
+/// Install the native drop bridge once for GPUI's dynamically-created
+/// NSWindow subclass. The raw window handle exposes the content NSView, from
+/// which we retrieve its owning GPUIWindow.
+fn install_native_drop_bridge() {
+    if ORIGINAL_NATIVE_PERFORM_DROP.get().is_some() {
+        return;
+    }
+    // GPUI creates this class during process initialization, before any app
+    // windows. Looking it up directly also avoids depending on when AppKit has
+    // attached the content NSView to its owning window.
+    let Some(native_window_class) = AnyClass::get(c"GPUIWindow") else {
+        return;
+    };
+    unsafe {
+        let Some(method) = native_window_class
+            .instance_method(objc2::sel!(performDragOperation:))
+        else {
+            return;
+        };
+        let original: NativePerformDrop = std::mem::transmute(method.implementation());
+        if ORIGINAL_NATIVE_PERFORM_DROP.set(original).is_err() {
+            return;
+        }
+        let replacement: Imp = std::mem::transmute(
+            shuffle_perform_native_drop as NativePerformDrop,
+        );
+        method.set_implementation(replacement);
+    }
+}
+
+/// GPUI registers only the legacy filename pasteboard type. Register every
+/// type advertised by NSFilePromiseReceiver as well so AppKit creates receiver
+/// objects for both modern and legacy promise sources (including WeChat).
+fn register_native_file_promise_types(window: &Window) {
+    let Some(view_ptr) = ns_view_ptr(window) else {
+        return;
+    };
+    let promise_types = NSFilePromiseReceiver::readableDraggedTypes();
+    let mut types = Vec::with_capacity(promise_types.count() + 2);
+    types.push(NSString::from_str("NSFilenamesPboardType"));
+    types.push(NSString::from_str("Apple files promise pasteboard type"));
+    for index in 0..promise_types.count() {
+        types.push(promise_types.objectAtIndex(index));
+    }
+    let types = NSArray::from_retained_slice(&types);
+    unsafe {
+        let native_window: *mut AnyObject = objc2::msg_send![view_ptr.cast::<AnyObject>(), window];
+        if !native_window.is_null() {
+            // GPUI owns and recreates its windows itself. Letting AppKit persist
+            // this native window can deadlock GPUI's key-window callback while
+            // restoring state after an abnormal exit (for example, a prior
+            // drag/drop crash), leaving only an invisible window on relaunch.
+            let _: () = objc2::msg_send![native_window, setRestorable: Bool::NO];
+            let _: () = objc2::msg_send![native_window, registerForDraggedTypes: &*types];
+        }
     }
 }
 
@@ -13814,6 +15977,7 @@ fn start_os_file_drag(view_ptr: *mut std::ffi::c_void, paths: &[PathBuf]) {
 
     let source = drag_source(mtm);
     let source_proto: &ProtocolObject<dyn NSDraggingSource> = ProtocolObject::from_ref(&*source);
+    SHUFFLE_FILE_DRAG_LIVE.store(true, Ordering::Relaxed);
     let _ = view.beginDraggingSessionWithItems_event_source(&array, &event, source_proto);
 }
 
@@ -14190,11 +16354,18 @@ fn format_size(is_dir: bool, size: u64) -> String {
 /// Read a directory's entries with full metadata (one `stat` per entry), sorted
 /// directories-first then case-insensitive by name. This is the slow path; the
 /// UI shows `read_entries_fast` first and swaps this in from the background.
-fn read_entries(dir: &Path) -> Vec<Entry> {
+fn is_hidden_name(name: &str) -> bool {
+    name.starts_with('.') && name != "." && name != ".."
+}
+
+fn read_entries(dir: &Path, show_hidden: bool) -> Vec<Entry> {
     let mut entries: Vec<Entry> = Vec::new();
     if let Ok(read_dir) = fs::read_dir(dir) {
         for entry in read_dir.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
+            if !show_hidden && is_hidden_name(&name) {
+                continue;
+            }
             // One stat, following symlinks: gives is_dir, size, and mtime.
             let md = fs::metadata(entry.path()).ok();
             let is_dir = md.as_ref().map(|m| m.is_dir()).unwrap_or(false);
@@ -14218,11 +16389,14 @@ fn read_entries(dir: &Path) -> Vec<Entry> {
 /// Read a directory's entries cheaply — names + folder/file from the readdir
 /// `d_type`, with **no** per-file `stat` (only symlinks are resolved). This is
 /// near-instant even for very large folders; size/dates fill in later.
-fn read_entries_fast(dir: &Path) -> Vec<Entry> {
+fn read_entries_fast(dir: &Path, show_hidden: bool) -> Vec<Entry> {
     let mut entries: Vec<Entry> = Vec::new();
     if let Ok(read_dir) = fs::read_dir(dir) {
         for entry in read_dir.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
+            if !show_hidden && is_hidden_name(&name) {
+                continue;
+            }
             let is_dir = match entry.file_type() {
                 Ok(t) if t.is_dir() => true,
                 // Resolving a symlink needs a stat, but symlinks are rare.
@@ -14256,12 +16430,12 @@ thread_local! {
 }
 
 /// Directory listing for a column (cached). Default sort (folders first, name).
-fn column_entries(dir: &Path) -> Vec<Entry> {
+fn column_entries(dir: &Path, show_hidden: bool) -> Vec<Entry> {
     if let Some(v) = COL_ENTRIES.with(|c| c.borrow().get(dir).cloned()) {
         return v;
     }
     // Columns only show name + icon, so the cheap (no-stat) read is enough.
-    let v = read_entries_fast(dir);
+    let v = read_entries_fast(dir, show_hidden);
     COL_ENTRIES.with(|c| c.borrow_mut().insert(dir.to_path_buf(), v.clone()));
     v
 }
@@ -14322,11 +16496,14 @@ fn split_path_query(q: &str) -> (PathBuf, String) {
 
 /// Lightweight directory listing for the palette: (name, is_dir). Uses the
 /// readdir file-type (cheap), only stat-ing symlinks to resolve dir-ness.
-fn list_dir_names(dir: &Path) -> Vec<(String, bool)> {
+fn list_dir_names(dir: &Path, show_hidden: bool) -> Vec<(String, bool)> {
     let mut out = Vec::new();
     if let Ok(read_dir) = fs::read_dir(dir) {
         for entry in read_dir.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
+            if !show_hidden && is_hidden_name(&name) {
+                continue;
+            }
             let is_dir = match entry.file_type() {
                 Ok(t) if t.is_dir() => true,
                 Ok(t) if t.is_symlink() => entry.path().is_dir(),
@@ -14336,6 +16513,61 @@ fn list_dir_names(dir: &Path) -> Vec<(String, bool)> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod hidden_file_tests {
+    use super::{is_hidden_name, list_dir_names, read_entries, read_entries_fast, Prefs};
+    use std::fs;
+
+    #[test]
+    fn recognizes_dot_prefixed_names_only() {
+        assert!(is_hidden_name(".git"));
+        assert!(is_hidden_name(".env"));
+        assert!(!is_hidden_name("report.txt"));
+        assert!(!is_hidden_name("."));
+        assert!(!is_hidden_name(".."));
+    }
+
+    #[test]
+    fn hidden_files_are_off_by_default() {
+        // Missing persisted keys keep upgrades from suddenly exposing dotfiles.
+        let default = Prefs::default();
+        assert!(!default.show_hidden);
+    }
+
+    #[test]
+    fn local_listing_respects_hidden_visibility() {
+        let dir = std::env::temp_dir().join(format!(
+            "shuffle-hidden-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("worker")
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("visible.txt"), b"visible").unwrap();
+        fs::write(dir.join(".hidden.txt"), b"hidden").unwrap();
+
+        for names in [
+            read_entries_fast(&dir, false)
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>(),
+            read_entries(&dir, false)
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect::<Vec<_>>(),
+            list_dir_names(&dir, false)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+        ] {
+            assert_eq!(names, vec!["visible.txt"]);
+        }
+        assert_eq!(read_entries_fast(&dir, true).len(), 2);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 /// Character bigrams of a string.
@@ -14685,18 +16917,18 @@ fn find_score(q: &str, name: &str) -> Option<i32> {
 }
 
 /// Built-in app commands whose name matches `q` (prefix or close typo), shown
-/// in the palette ahead of file results. Currently just "Settings".
+/// in the palette ahead of file results. Currently just Settings.
 fn command_matches(q: &str) -> Vec<PaletteItem> {
     let ql = q.to_lowercase();
     let mut out = Vec::new();
-    let aliases = ["settings", "preferences", "config"];
+    let aliases = ["settings", "preferences", "config", "设置", "偏好设置", "配置"];
     let hit = aliases
         .iter()
         .any(|a| a.starts_with(&ql) || dice(&ql, a) >= 0.6);
     if hit {
         out.push(PaletteItem {
-            title: "Settings".to_string(),
-            subtitle: "Open Shuffle settings".to_string(),
+            title: "设置".to_string(),
+            subtitle: "打开 Shuffle 设置".to_string(),
             action: Action::OpenSettings,
             is_dir: false,
         });
@@ -14771,6 +17003,7 @@ struct IndexEntry {
     name: String,
     path: PathBuf,
     is_dir: bool,
+    modified: Option<SystemTime>,
 }
 
 /// A flat, in-memory index of everything under a root directory, used for fast
@@ -14850,10 +17083,12 @@ impl FileIndex {
             }
             let is_dir = e.file_type().is_dir();
             let name = e.file_name().to_string_lossy().into_owned();
+            let modified = e.metadata().ok().and_then(|metadata| metadata.modified().ok());
             entries.push(IndexEntry {
                 name,
                 path: e.path(),
                 is_dir,
+                modified,
             });
         }
         FileIndex { entries }
@@ -14861,6 +17096,18 @@ impl FileIndex {
 
     /// Fuzzy-rank the index against `query` in parallel; return the top `limit`.
     fn search(&self, query: &str, limit: usize) -> Vec<(String, PathBuf, bool)> {
+        self.search_scoped(query, limit, None, PaletteSearchSort::Relevance)
+    }
+
+    /// Search an optional path subtree and arrange the matching files by fuzzy
+    /// relevance, displayed kind, or newest modification time.
+    fn search_scoped(
+        &self,
+        query: &str,
+        limit: usize,
+        root: Option<&Path>,
+        sort: PaletteSearchSort,
+    ) -> Vec<(String, PathBuf, bool)> {
         let q: Vec<char> = query.chars().flat_map(|c| c.to_lowercase()).collect();
         if q.is_empty() {
             return Vec::new();
@@ -14872,13 +17119,40 @@ impl FileIndex {
             .par_iter()
             .enumerate()
             .filter_map(|(i, e)| {
+                if root.is_some_and(|root| !e.path.starts_with(root)) {
+                    return None;
+                }
                 rank_entry(&q, &q_str, &q_bigrams, &e.name, &e.path, e.is_dir).map(|s| (s, i))
             })
             .collect();
-        scored.sort_unstable_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then_with(|| self.entries[a.1].name.len().cmp(&self.entries[b.1].name.len()))
-        });
+        match sort {
+            PaletteSearchSort::Relevance => scored.sort_unstable_by(|a, b| {
+                b.0.cmp(&a.0).then_with(|| {
+                    self.entries[a.1]
+                        .name
+                        .len()
+                        .cmp(&self.entries[b.1].name.len())
+                })
+            }),
+            PaletteSearchSort::Kind => scored.sort_unstable_by(|a, b| {
+                let left = &self.entries[a.1];
+                let right = &self.entries[b.1];
+                kind_label(&left.name, left.is_dir)
+                    .to_lowercase()
+                    .cmp(&kind_label(&right.name, right.is_dir).to_lowercase())
+                    .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+                    .then_with(|| b.0.cmp(&a.0))
+            }),
+            PaletteSearchSort::Modified => scored.sort_unstable_by(|a, b| {
+                let left = &self.entries[a.1];
+                let right = &self.entries[b.1];
+                right
+                    .modified
+                    .cmp(&left.modified)
+                    .then_with(|| b.0.cmp(&a.0))
+                    .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            }),
+        }
         scored.truncate(limit);
         scored
             .into_iter()
@@ -14887,6 +17161,78 @@ impl FileIndex {
                 (e.name.clone(), e.path.clone(), e.is_dir)
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod palette_search_tests {
+    use super::*;
+
+    fn indexed(path: &str, is_dir: bool, modified_secs: u64) -> IndexEntry {
+        let path = PathBuf::from(path);
+        IndexEntry {
+            name: path.file_name().unwrap().to_string_lossy().into_owned(),
+            path,
+            is_dir,
+            modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(modified_secs)),
+        }
+    }
+
+    #[test]
+    fn current_directory_scope_excludes_other_subtrees() {
+        let index = FileIndex {
+            entries: vec![
+                indexed("/search/current/report-current.txt", false, 10),
+                indexed("/search/other/report-other.txt", false, 20),
+            ],
+        };
+
+        let hits = index.search_scoped(
+            "report",
+            40,
+            Some(Path::new("/search/current")),
+            PaletteSearchSort::Relevance,
+        );
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "report-current.txt");
+    }
+
+    #[test]
+    fn kind_sort_groups_results_by_displayed_type() {
+        let index = FileIndex {
+            entries: vec![
+                indexed("/search/report.txt", false, 10),
+                indexed("/search/report.pdf", false, 20),
+                indexed("/search/report-folder", true, 30),
+            ],
+        };
+
+        let hits = index.search_scoped("report", 40, None, PaletteSearchSort::Kind);
+        let labels: Vec<String> = hits
+            .iter()
+            .map(|(name, _, is_dir)| kind_label(name, *is_dir).to_lowercase())
+            .collect();
+        let mut sorted = labels.clone();
+        sorted.sort();
+
+        assert_eq!(labels, sorted);
+    }
+
+    #[test]
+    fn modified_sort_puts_newest_result_first() {
+        let index = FileIndex {
+            entries: vec![
+                indexed("/search/report-old.txt", false, 10),
+                indexed("/search/report-new.txt", false, 30),
+                indexed("/search/report-middle.txt", false, 20),
+            ],
+        };
+
+        let hits = index.search_scoped("report", 40, None, PaletteSearchSort::Modified);
+
+        assert_eq!(hits[0].0, "report-new.txt");
+        assert_eq!(hits[2].0, "report-old.txt");
     }
 }
 
@@ -15057,9 +17403,9 @@ fn mdfind_content(dir: &Path, term: &str) -> HashSet<PathBuf> {
     out
 }
 
-/// Operator-driven global search for the command palette: content:/kind:/ext:/
-/// size:/date: over the home index (or Spotlight for content), returning up to
-/// 40 palette items. Runs off the UI thread.
+/// Operator-driven search for the command palette: content:/kind:/ext:/size:/
+/// date: over the selected root (or Spotlight for content), returning up to 40
+/// palette items. Runs off the UI thread.
 ///
 /// Staged to keep metadata I/O bounded: cheap predicates (kind/ext + name)
 /// narrow the candidate set first; only the surviving top slice is `stat`ed for
@@ -15067,29 +17413,34 @@ fn mdfind_content(dir: &Path, term: &str) -> HashSet<PathBuf> {
 fn palette_operator_search(
     fq: &FilterQuery,
     index: Option<&FileIndex>,
-    home: &Path,
+    root: &Path,
+    sort: PaletteSearchSort,
 ) -> Vec<PaletteItem> {
     // 1. Raw candidates: Spotlight content hits, else the whole name index.
-    let mut cands: Vec<(String, PathBuf, bool)> = Vec::new();
+    let mut cands: Vec<(String, PathBuf, bool, Option<SystemTime>)> = Vec::new();
     if let Some(term) = &fq.content {
-        for p in mdfind_content(home, term).into_iter().take(4000) {
+        for p in mdfind_content(root, term).into_iter().take(4000) {
             let Some(name) = p.file_name().map(|n| n.to_string_lossy().into_owned()) else {
                 continue;
             };
-            let is_dir = p.is_dir();
-            cands.push((name, p, is_dir));
+            let metadata = fs::metadata(&p).ok();
+            let is_dir = metadata.as_ref().is_some_and(|m| m.is_dir());
+            let modified = metadata.as_ref().and_then(|m| m.modified().ok());
+            cands.push((name, p, is_dir, modified));
         }
     } else if let Some(idx) = index {
         cands.reserve(idx.entries.len());
         for e in &idx.entries {
-            cands.push((e.name.clone(), e.path.clone(), e.is_dir));
+            if e.path.starts_with(root) {
+                cands.push((e.name.clone(), e.path.clone(), e.is_dir, e.modified));
+            }
         }
     }
 
     // 2. Cheap filter (kind/ext) + optional name ranking — no disk I/O.
     let has_text = !fq.text.is_empty();
-    let mut scored: Vec<(i32, String, PathBuf, bool)> = Vec::new();
-    for (name, path, is_dir) in cands {
+    let mut scored: Vec<(i32, String, PathBuf, bool, Option<SystemTime>)> = Vec::new();
+    for (name, path, is_dir, modified) in cands {
         if !fq.kinds.is_empty() && !fq.kinds.iter().any(|k| k.matches(&name, is_dir)) {
             continue;
         }
@@ -15111,25 +17462,47 @@ fn palette_operator_search(
         } else {
             0
         };
-        scored.push((score, name, path, is_dir));
+        scored.push((score, name, path, is_dir, modified));
     }
 
     // 3. Rank, then cap before the (potentially) stat-heavy stage.
-    if has_text {
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.len().cmp(&b.1.len())));
-    } else {
-        scored.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+    match sort {
+        PaletteSearchSort::Relevance if has_text => {
+            scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.len().cmp(&b.1.len())));
+        }
+        PaletteSearchSort::Relevance => {
+            scored.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        }
+        PaletteSearchSort::Kind => {
+            scored.sort_by(|a, b| {
+                kind_label(&a.1, a.3)
+                    .to_lowercase()
+                    .cmp(&kind_label(&b.1, b.3).to_lowercase())
+                    .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+                    .then_with(|| b.0.cmp(&a.0))
+            });
+        }
+        PaletteSearchSort::Modified => {
+            scored.sort_by(|a, b| {
+                b.4.cmp(&a.4)
+                    .then_with(|| b.0.cmp(&a.0))
+                    .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+            });
+        }
     }
     scored.truncate(400);
 
     // 4. Apply size/date (needs metadata) only to the survivors.
     let need_meta = fq.size.is_some() || fq.after.is_some() || fq.before.is_some();
     let mut out = Vec::new();
-    for (_, name, path, is_dir) in scored {
+    for (_, name, path, is_dir, indexed_modified) in scored {
         if need_meta {
             let md = fs::metadata(&path).ok();
             let size = md.as_ref().map(|m| m.len()).unwrap_or(0);
-            let mtime = md.as_ref().and_then(|m| m.modified().ok());
+            let mtime = md
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .or(indexed_modified);
             if !fq.matches_entry(&name, is_dir, size, mtime) {
                 continue;
             }
@@ -15147,8 +17520,17 @@ fn palette_operator_search(
     out
 }
 
-fn search_filesystem(query: &str) -> Vec<(String, PathBuf, bool)> {
-    let mut child = match Command::new("mdfind")
+fn search_filesystem(
+    query: &str,
+    root: Option<&Path>,
+    sort: PaletteSearchSort,
+    limit: usize,
+) -> Vec<(String, PathBuf, bool)> {
+    let mut command = Command::new("mdfind");
+    if let Some(root) = root {
+        command.arg("-onlyin").arg(root);
+    }
+    let mut child = match command
         .arg("-name")
         .arg(query)
         .stdout(Stdio::piped())
@@ -15186,14 +17568,35 @@ fn search_filesystem(query: &str) -> Vec<(String, PathBuf, bool)> {
     let _ = child.kill();
     let _ = child.wait();
 
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
-    scored.truncate(40);
-    scored
+    let mut hits: Vec<(i32, String, PathBuf, bool, Option<SystemTime>)> = scored
         .into_iter()
         .map(|(_, name, path)| {
-            let is_dir = path.is_dir();
-            (name, path, is_dir)
+            let metadata = fs::metadata(&path).ok();
+            let is_dir = metadata.as_ref().is_some_and(|m| m.is_dir());
+            let modified = metadata.as_ref().and_then(|m| m.modified().ok());
+            let score = score_entry(&q, &q_str, &name, &path, is_dir).unwrap_or_default();
+            (score, name, path, is_dir, modified)
         })
+        .collect();
+    match sort {
+        PaletteSearchSort::Relevance => hits.sort_by(|a, b| b.0.cmp(&a.0)),
+        PaletteSearchSort::Kind => hits.sort_by(|a, b| {
+            kind_label(&a.1, a.3)
+                .to_lowercase()
+                .cmp(&kind_label(&b.1, b.3).to_lowercase())
+                .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+                .then_with(|| b.0.cmp(&a.0))
+        }),
+        PaletteSearchSort::Modified => hits.sort_by(|a, b| {
+            b.4.cmp(&a.4)
+                .then_with(|| b.0.cmp(&a.0))
+                .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+        }),
+    }
+    hits.truncate(limit);
+    hits
+        .into_iter()
+        .map(|(_, name, path, is_dir, _)| (name, path, is_dir))
         .collect()
 }
 
@@ -15203,8 +17606,8 @@ fn path_label(p: &Path) -> String {
         return "Macintosh HD".to_string();
     }
     p.file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| p.display().to_string())
+        .map(|s| single_line_name(&s.to_string_lossy()))
+        .unwrap_or_else(|| single_line_name(&p.display().to_string()))
 }
 
 // ----- persisted state -------------------------------------------------------
@@ -15720,8 +18123,8 @@ fn save_prefs(p: &Prefs) {
             let _ = fs::create_dir_all(parent);
         }
         let body = format!(
-            "terminal={}\nterm_history={}\npreview={}\npreview_pages={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_filter_button={}\nshow_fps={}\nscript_actions={}\nssh_use_system={}\nssh_configured={}\nwaterfall={}\n",
-            p.terminal, p.term_history, p.preview, p.preview_pages, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_filter_button, p.show_fps, p.script_actions, p.ssh_use_system, p.ssh_configured, p.waterfall
+            "terminal={}\nterm_history={}\npreview={}\npreview_pages={}\ninfo={}\nshow_parent={}\nshow_hidden={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_filter_button={}\nshow_fps={}\nscript_actions={}\nssh_use_system={}\nssh_configured={}\nwaterfall={}\n",
+            p.terminal, p.term_history, p.preview, p.preview_pages, p.info, p.show_parent, p.show_hidden, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_filter_button, p.show_fps, p.script_actions, p.ssh_use_system, p.ssh_configured, p.waterfall
         );
         let _ = fs::write(&file, body);
     }
@@ -15849,6 +18252,7 @@ fn load_prefs() -> Prefs {
                     "preview_pages" => p.preview_pages = on,
                     "info" => p.info = on,
                     "show_parent" => p.show_parent = on,
+                    "show_hidden" => p.show_hidden = on,
                     "sidebar_collapsed" => p.sidebar_collapsed = on,
                     "recent_limit" => {
                         if let Ok(n) = v.trim().parse::<usize>() {
@@ -15928,7 +18332,7 @@ fn main() {
                       drwxr-xr-x    2 1000     1000         4096 Jul 30 10:00 .\n\
                       drwxr-xr-x    9 1000     1000         4096 Jul 30 10:00 ..\n\
                       sftp> ls -la /home/user";
-        for e in parse_sftp_ls(sample) {
+        for e in parse_sftp_ls(sample, true) {
             eprintln!("  {:<14} dir={} size={}", e.name, e.is_dir, e.size);
         }
         return;
@@ -15961,7 +18365,7 @@ fn main() {
             Ok(h) => eprintln!("home: {h}"),
             Err(e) => eprintln!("home error: {e}"),
         }
-        match sftp_list(&srv, &path, true) {
+        match sftp_list(&srv, &path, true, prefs().show_hidden) {
             Ok(es) => {
                 eprintln!("{} entries:", es.len());
                 for e in es.iter().take(20) {
@@ -16086,6 +18490,7 @@ fn main() {
                 name: path.file_name().unwrap().to_string_lossy().into_owned(),
                 path,
                 is_dir,
+                modified: None,
             }
         };
         let index = FileIndex {
@@ -16115,7 +18520,7 @@ fn main() {
         let p = PathBuf::from(&args[2]);
 
         let t = std::time::Instant::now();
-        let fast = read_entries_fast(&p);
+        let fast = read_entries_fast(&p, prefs().show_hidden);
         eprintln!(
             "read_entries_fast: {} entries in {} ms",
             fast.len(),
@@ -16123,7 +18528,7 @@ fn main() {
         );
 
         let t = std::time::Instant::now();
-        let full = read_entries(&p);
+        let full = read_entries(&p, prefs().show_hidden);
         eprintln!(
             "read_entries (stat each): {} entries in {} ms",
             full.len(),
@@ -16181,6 +18586,14 @@ fn main() {
         return;
     }
 
+    // Shuffle persists its own tabs and last directory. Disable AppKit's
+    // separate window restoration before GPUI creates NSApplication; stale
+    // native restoration records after a crash can otherwise re-enter GPUI's
+    // key-window callback and deadlock launch.
+    NSUserDefaults::standardUserDefaults().setBool_forKey(
+        true,
+        &NSString::from_str("ApplePersistenceIgnoreState"),
+    );
     let app = Application::new();
     // Re-open the window when the Dock icon is clicked after the last window was
     // closed (otherwise the app stays running with no way to show it).
@@ -16240,9 +18653,9 @@ fn main() {
         cx.set_menus(vec![Menu {
             name: "Shuffle".into(),
             items: vec![
-                MenuItem::action("Settings…", OpenSettings),
+                MenuItem::action("设置…", OpenSettings),
                 MenuItem::separator(),
-                MenuItem::action("Quit Shuffle", Quit),
+                MenuItem::action("退出 Shuffle", Quit),
             ],
         }]);
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
@@ -16268,6 +18681,8 @@ fn open_main_window(cx: &mut App) {
             ..Default::default()
         },
         |window, cx| {
+            install_native_drop_bridge();
+            register_native_file_promise_types(window);
             let view = cx.new(|cx| {
                 let mut finder = Shuffle::new(load_last_dir(), cx);
                 finder.prewarm_icons(cx);
