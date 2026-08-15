@@ -3220,6 +3220,10 @@ struct Tab {
     /// Bumps each time a content search is kicked off, so a stale mdfind result
     /// is discarded.
     content_gen: u64,
+    /// Bumps each time a find scan is scheduled, so a stale background
+    /// ranking (from an older keystroke or a re-sorted/reloaded entry list)
+    /// is discarded instead of applied.
+    find_epoch: u64,
     scroll_handle: UniformListScrollHandle,
     /// Horizontal scroll of the columns (when they're wider than the pane).
     h_scroll: ScrollHandle,
@@ -3276,6 +3280,7 @@ impl Tab {
             content_hits: None,
             content_for: None,
             content_gen: 0,
+            find_epoch: 0,
             scroll_handle: UniformListScrollHandle::new(),
             h_scroll: ScrollHandle::new(),
             selection: HashSet::new(),
@@ -3918,7 +3923,7 @@ impl Shuffle {
         match target {
             ImeTarget::Palette => self.refresh_palette(cx),
             ImeTarget::Find(pane) => {
-                self.recompute_find(pane);
+                self.recompute_find(pane, cx);
                 self.update_content_search(pane, cx);
             }
             _ => cx.notify(),
@@ -4081,7 +4086,7 @@ impl Shuffle {
         self.tab_mut(pane).load_gen = gen;
         self.sort_tab(pane);
         if self.tab(pane).find_query.is_some() {
-            self.recompute_find(pane);
+            self.recompute_find(pane, cx);
         }
         cx.notify();
         self.prewarm_icons(cx);
@@ -4100,7 +4105,7 @@ impl Shuffle {
                     this.tab_mut(pane).entries = full;
                     this.sort_tab(pane);
                     if this.tab(pane).find_query.is_some() {
-                        this.recompute_find(pane);
+                        this.recompute_find(pane, cx);
                     }
                     cx.notify();
                     this.prewarm_icons(cx);
@@ -4146,7 +4151,7 @@ impl Shuffle {
                         this.remote_error = None;
                         this.sort_tab(pane);
                         if this.tab(pane).find_query.is_some() {
-                            this.recompute_find(pane);
+                            this.recompute_find(pane, cx);
                         }
                         this.prewarm_icons(cx);
                     }
@@ -4285,7 +4290,7 @@ impl Shuffle {
         }
         self.sort_tab(pane);
         if self.tab(pane).find_query.is_some() {
-            self.recompute_find(pane);
+            self.recompute_find(pane, cx);
         }
         cx.notify();
     }
@@ -8691,7 +8696,7 @@ impl Shuffle {
         tab.find_query = Some(String::new());
         tab.find_cursor = 0;
         tab.find_anchor = None;
-        self.recompute_find(pane);
+        self.recompute_find(pane, cx);
         cx.notify();
     }
 
@@ -8776,7 +8781,7 @@ impl Shuffle {
 
     /// Recompute a pane's `find_results`. Empty query shows every entry;
     /// otherwise filters + ranks by similarity (typo-tolerant).
-    fn recompute_find(&mut self, pane: usize) {
+    fn recompute_find(&mut self, pane: usize, cx: &mut Context<Self>) {
         let tab = self.tab_mut(pane);
         let Some(q) = tab.find_query.as_deref() else {
             return;
@@ -8809,39 +8814,65 @@ impl Shuffle {
         // rank by, keep the list's existing order; otherwise rank by match.
         let keep_order = tab.sort_key != SortKey::None || !has_text;
 
-        let mut scored: Vec<(i32, usize)> = Vec::new();
-        for (i, e) in tab.entries.iter().enumerate() {
-            if !fq.matches_entry(&e.name, e.is_dir, e.size, e.modified) {
-                continue;
-            }
-            if let Some(hits) = content_ready {
-                if !hits.contains(&dir.join(&e.name)) {
+        // No free text to rank by (operator filters only, or a column sort
+        // active): the pass is cheap and runs inline, so toggling ext:/size:
+        // filters still resolves this frame.
+        if !has_text || keep_order {
+            let mut out = Vec::new();
+            for (i, e) in tab.entries.iter().enumerate() {
+                if !fq.matches_entry(&e.name, e.is_dir, e.size, e.modified) {
                     continue;
                 }
-            }
-            let score = if has_text {
-                match find_score(&plain, &e.name) {
-                    Some(s) => s,
-                    None => continue,
+                if let Some(hits) = content_ready {
+                    if !hits.contains(&dir.join(&e.name)) {
+                        continue;
+                    }
                 }
-            } else {
-                0
-            };
-            scored.push((score, i));
+                out.push(i);
+            }
+            tab.find_results = out;
+            return;
         }
 
-        if !keep_order {
-            // Best score first; ties → dirs first, then alphabetical.
-            let entries = &tab.entries;
-            scored.sort_by(|a, b| {
-                b.0.cmp(&a.0)
-                    .then_with(|| entries[b.1].is_dir.cmp(&entries[a.1].is_dir))
-                    .then_with(|| {
-                        entries[a.1].name.to_lowercase().cmp(&entries[b.1].name.to_lowercase())
-                    })
+        // Free-text ranking is O(entries) with per-name allocations and a sort;
+        // run it on a background thread so typing in the filter never blocks a
+        // frame. Snapshot only the fields the scorer needs (cheap one-time
+        // clone), clear the results now so a stale index list can't be read
+        // against re-sorted/reloaded entries, and bump the epoch so an older
+        // in-flight scan is discarded. A new keystroke lands results in place
+        // when its scan finishes.
+        let names: Vec<(usize, String, bool, u64, Option<SystemTime>)> = tab
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (i, e.name.clone(), e.is_dir, e.size, e.modified))
+            .collect();
+        let content = content_ready.cloned();
+        tab.find_results.clear();
+        tab.find_epoch += 1;
+        let epoch = tab.find_epoch;
+        let captured_q = tab.find_query.clone().unwrap_or_default();
+        cx.spawn(async move |this, cx| {
+            let scored = cx
+                .background_spawn(async move {
+                    find_scan(&dir, &names, &fq, &plain, content.as_ref())
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if pane >= this.panes.len() {
+                    return;
+                }
+                let tab = this.tab_mut(pane);
+                if tab.find_epoch != epoch
+                    || tab.find_query.as_deref() != Some(captured_q.as_str())
+                {
+                    return;
+                }
+                tab.find_results = scored;
+                cx.notify();
             });
-        }
-        tab.find_results = scored.into_iter().map(|(_, i)| i).collect();
+        })
+        .detach();
     }
 
     /// Kick off (or clear) the Spotlight content search for a pane's filter.
@@ -8887,7 +8918,7 @@ impl Shuffle {
                 let tab = this.tab_mut(pane);
                 tab.content_hits = Some(hits);
                 tab.content_for = Some(term);
-                this.recompute_find(pane);
+                this.recompute_find(pane, cx);
                 cx.notify();
             });
         })
@@ -8989,7 +9020,7 @@ impl Shuffle {
                         tab.find_cursor -= 1;
                     }
                 }
-                self.recompute_find(pane);
+                self.recompute_find(pane, cx);
                 self.update_content_search(pane, cx);
                 cx.notify();
             }
@@ -9007,7 +9038,7 @@ impl Shuffle {
             "v" if cmd => {
                 if let Some(t) = cx.read_from_clipboard().and_then(|i| i.text()) {
                     self.find_insert(pane, t.trim());
-                    self.recompute_find(pane);
+                    self.recompute_find(pane, cx);
                     self.update_content_search(pane, cx);
                     cx.notify();
                 }
@@ -16916,6 +16947,50 @@ fn find_score(q: &str, name: &str) -> Option<i32> {
     None
 }
 
+/// The find bar's ranking pass over one snapshot row set: filter by
+/// `fq`/`content`, then rank by fuzzy score (ties → dirs first, then
+/// case-insensitive name). Pure, so it runs off the UI thread and is
+/// unit-testable; empty `plain` keeps entry order.
+fn find_scan(
+    dir: &Path,
+    rows: &[(usize, String, bool, u64, Option<SystemTime>)],
+    fq: &FilterQuery,
+    plain: &str,
+    content: Option<&HashSet<PathBuf>>,
+) -> Vec<usize> {
+    let mut scored: Vec<(i32, usize)> = Vec::new();
+    for (i, name, is_dir, size, modified) in rows {
+        if !fq.matches_entry(name, *is_dir, *size, *modified) {
+            continue;
+        }
+        if let Some(hits) = content {
+            if !hits.contains(&dir.join(name)) {
+                continue;
+            }
+        }
+        if plain.is_empty() {
+            scored.push((0, *i));
+            continue;
+        }
+        let Some(score) = find_score(plain, name) else {
+            continue;
+        };
+        scored.push((score, *i));
+    }
+    if plain.is_empty() {
+        return scored.into_iter().map(|(_, i)| i).collect();
+    }
+    // Best score first; ties → dirs first, then alphabetical.
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| rows[b.1].2.cmp(&rows[a.1].2))
+            .then_with(|| {
+                rows[a.1].1.to_lowercase().cmp(&rows[b.1].1.to_lowercase())
+            })
+    });
+    scored.into_iter().map(|(_, i)| i).collect()
+}
+
 /// Built-in app commands whose name matches `q` (prefix or close typo), shown
 /// in the palette ahead of file results. Currently just Settings.
 fn command_matches(q: &str) -> Vec<PaletteItem> {
@@ -17233,6 +17308,40 @@ mod palette_search_tests {
 
         assert_eq!(hits[0].0, "report-new.txt");
         assert_eq!(hits[2].0, "report-old.txt");
+    }
+}
+
+#[cfg(test)]
+mod find_scan_tests {
+    use super::*;
+
+    /// Rows in directory order: an exact name, a dir tie-break candidate, a
+    /// non-match, and a fuzzy match — the scan must rank by score, prefer
+    /// dirs on ties, and drop non-matches, mirroring the pre-async behavior.
+    #[test]
+    fn ranks_by_score_then_dir_then_name() {
+        let rows = vec![
+            (0usize, "report".into(), false, 0u64, None),
+            (1usize, "report-dir".into(), true, 0u64, None),
+            (2usize, "notes.md".into(), false, 0u64, None),
+            (3usize, "zzz-report".into(), false, 0u64, None),
+        ];
+        let fq = FilterQuery::parse("report");
+        let hits = find_scan(Path::new("/tmp"), &rows, &fq, "report", None);
+        // Exact match first; among equal prefix scores the dir wins the
+        // tie-break; the unrelated file is absent.
+        assert_eq!(hits, vec![0, 1, 3]);
+    }
+
+    #[test]
+    fn empty_plain_keeps_entry_order() {
+        let rows = vec![
+            (0usize, "b.txt".into(), false, 0u64, None),
+            (1usize, "a.txt".into(), false, 0u64, None),
+        ];
+        let fq = FilterQuery::parse("ext:txt");
+        let hits = find_scan(Path::new("/tmp"), &rows, &fq, "", None);
+        assert_eq!(hits, vec![0, 1]);
     }
 }
 
