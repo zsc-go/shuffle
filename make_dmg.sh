@@ -44,7 +44,7 @@ if [ -n "$SHUFFLE_DEVID" ]; then
     # Sign nested helper executables first, then the app, with the hardened
     # runtime. Every bundled helper must be signed or the outer bundle's
     # signature is rejected ("code object is not signed at all in subcomponent").
-    for helper in removebg cloudctl; do
+    for helper in removebg cloudctl 7zz; do
         if [ -f "$APP/Contents/MacOS/$helper" ]; then
             codesign --force --options runtime --timestamp \
                 --sign "$SHUFFLE_DEVID" "$APP/Contents/MacOS/$helper"
