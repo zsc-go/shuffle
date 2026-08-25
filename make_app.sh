@@ -51,6 +51,20 @@ if command -v swiftc >/dev/null 2>&1; then
     else
         echo "WARNING: removebg helper failed to compile (Remove Background disabled)"
     fi
+
+    # "cloudctl" helper: download / evict cloud files (iCloud + File Provider).
+    # Universal too. Best-effort — if it fails, the cloud actions just hide.
+    if swiftc -O -target arm64-apple-macos12 cloudctl.swift -o "$APP/Contents/MacOS/cloudctl.arm64" 2>/dev/null \
+        && swiftc -O -target x86_64-apple-macos12 cloudctl.swift -o "$APP/Contents/MacOS/cloudctl.x86" 2>/dev/null; then
+        lipo -create "$APP/Contents/MacOS/cloudctl.arm64" "$APP/Contents/MacOS/cloudctl.x86" \
+            -output "$APP/Contents/MacOS/cloudctl"
+        rm -f "$APP/Contents/MacOS/cloudctl.arm64" "$APP/Contents/MacOS/cloudctl.x86"
+        echo "Built cloudctl helper: $(lipo -archs "$APP/Contents/MacOS/cloudctl")"
+    elif swiftc -O cloudctl.swift -o "$APP/Contents/MacOS/cloudctl" 2>/dev/null; then
+        echo "Built cloudctl helper (host arch only)"
+    else
+        echo "WARNING: cloudctl helper failed to compile (cloud download/evict disabled)"
+    fi
 fi
 
 cat > "$APP/Contents/Info.plist" <<PLIST
@@ -89,17 +103,21 @@ PLIST
 # instead of re-prompting every run (which ad-hoc signing causes).
 SIGN_ID="${SHUFFLE_SIGN_ID:-Apple Development: Jaime Guzman (7UB4C2P6D6)}"
 if security find-identity -v -p codesigning 2>/dev/null | grep -q "$SIGN_ID"; then
-    # Nested executables must be signed before the enclosing application bundle.
-    # Otherwise codesign refuses to seal the outer bundle.
-    [ ! -f "$APP/Contents/MacOS/removebg" ] || codesign --force --sign "$SIGN_ID" "$APP/Contents/MacOS/removebg"
-    [ ! -f "$APP/Contents/MacOS/7zz" ] || codesign --force --sign "$SIGN_ID" "$APP/Contents/MacOS/7zz"
-    codesign --force --sign "$SIGN_ID" --identifier com.shuffle.app "$APP"
+    SIGN_WITH="$SIGN_ID"
     echo "Signed with: $SIGN_ID"
 else
     echo "WARNING: signing identity not found; falling back to ad-hoc (permissions will re-prompt)."
-    [ ! -f "$APP/Contents/MacOS/removebg" ] || codesign --force --sign - "$APP/Contents/MacOS/removebg"
-    [ ! -f "$APP/Contents/MacOS/7zz" ] || codesign --force --sign - "$APP/Contents/MacOS/7zz"
-    codesign --force --sign - --identifier com.shuffle.app "$APP"
+    SIGN_WITH="-"
+
 fi
+# Sign nested helper executables BEFORE the app. Extra Mach-Os in Contents/MacOS
+# are treated as nested code that must already be signed, or sealing the bundle
+# fails ("code object is not signed at all in subcomponent").
+for helper in removebg cloudctl 7zz; do
+    if [ -f "$APP/Contents/MacOS/$helper" ]; then
+        codesign --force --sign "$SIGN_WITH" "$APP/Contents/MacOS/$helper"
+    fi
+done
+codesign --force --sign "$SIGN_WITH" --identifier com.shuffle.app "$APP"
 codesign -dv --verbose=2 "$APP" 2>&1 | grep -iE 'Identifier|Authority|Signature' | head -3
 echo "Built $APP"

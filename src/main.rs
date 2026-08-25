@@ -361,6 +361,10 @@ struct Prefs {
     ssh_configured: bool,
     /// Show the expandable "waterfall" folder tree at the bottom of the sidebar.
     waterfall: bool,
+    /// Command palette / search window opacity, as a percent (40–100). Lower is
+    /// more see-through; the default is nearly opaque so it doesn't read as a
+    /// confusing floating pane over the explorer.
+    palette_opacity: u8,
 }
 
 impl Default for Prefs {
@@ -383,6 +387,7 @@ impl Default for Prefs {
             ssh_use_system: true,
             ssh_configured: false,
             waterfall: false,
+            palette_opacity: 92,
         }
     }
 }
@@ -410,12 +415,19 @@ thread_local! {
         ssh_use_system: true,
         ssh_configured: false,
         waterfall: false,
+        palette_opacity: 92,
     }) };
 }
 
 /// The active preferences. Read this anywhere in render code.
 fn prefs() -> Prefs {
     ACTIVE_PREFS.with(|p| *p.borrow())
+}
+
+/// The command palette's background alpha (0–255) from the opacity pref.
+fn palette_alpha() -> u32 {
+    let pct = prefs().palette_opacity.clamp(40, 100) as u32;
+    pct * 255 / 100
 }
 
 fn set_active_prefs(p: Prefs) {
@@ -1756,19 +1768,41 @@ impl Settings {
             settings_section(
                 "命令面板",
                 Some("Cmd+P 搜索与操作。"),
-                vec![toggle_row(
-                    "tg-palette-history",
-                    "命令面板历史记录",
-                    "为 Cmd+P 保存独立的查询历史；在命令面板中按上/下方向键可切换之前的搜索。",
-                    p.palette_history,
-                    cx.listener(|_, _: &ClickEvent, _, cx| {
-                        let mut np = prefs();
-                        np.palette_history = !np.palette_history;
-                        apply_prefs(np, cx);
-                        cx.notify();
-                    }),
-                )
-                .into_any_element()],
+                vec![
+                    toggle_row(
+                        "tg-palette-history",
+                        "命令面板历史记录",
+                        "为 Cmd+P 保存独立的查询历史；在命令面板中按上/下方向键可切换之前的搜索。",
+                        p.palette_history,
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut np = prefs();
+                            np.palette_history = !np.palette_history;
+                            apply_prefs(np, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+                    stepper_row(
+                        "st-palette-opacity",
+                        "搜索窗口不透明度",
+                        "Cmd+P 搜索窗口的不透明度；较低时可看到资源管理器，默认值较高以保证可读性。",
+                        format!("{}%", p.palette_opacity),
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut np = prefs();
+                            np.palette_opacity = np.palette_opacity.saturating_sub(5).max(40);
+                            apply_prefs(np, cx);
+                            cx.notify();
+                        }),
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut np = prefs();
+                            np.palette_opacity = (np.palette_opacity + 5).min(100);
+                            apply_prefs(np, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+                ],
+
             ),
             settings_section(
                 "侧边栏",
@@ -3233,6 +3267,25 @@ struct Entry {
     loaded: bool,
 }
 
+/// A file's cloud-storage materialization state. Detected from the kernel's
+/// `SF_DATALESS` flag, which Finder itself uses — set on iCloud and File
+/// Provider (Dropbox, Google Drive, OneDrive, …) placeholders whose bytes live
+/// in the cloud, not on disk.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CloudSync {
+    /// Not a cloud placeholder: an ordinary local file, or a fully downloaded
+    /// cloud file. No badge.
+    Local,
+    /// Online-only: content is in the cloud, not materialized on disk.
+    OnlineOnly,
+    /// Actively downloading (we kicked off a materialize; clears once local).
+    Syncing,
+}
+
+/// `SF_DATALESS` (super-user file flag): the bytes aren't on disk — a cloud
+/// placeholder. See `chflags(2)` / `<sys/stat.h>`.
+const SF_DATALESS: u32 = 0x4000_0000;
+
 /// How the listing is sorted. `None` is the default (folders first, by name).
 #[derive(Clone, Copy, PartialEq)]
 enum SortKey {
@@ -3582,6 +3635,19 @@ struct Shuffle {
     /// Each cached waterfall folder's mtime, so the folder watcher can spot an
     /// outside change and invalidate just that folder for a live refresh.
     waterfall_mtime: HashMap<PathBuf, SystemTime>,
+    /// Cloud files with a download/evict in flight — shown with the syncing
+    /// badge until the operation finishes and the listing is re-read.
+    cloud_busy: HashSet<PathBuf>,
+}
+
+/// Which cloud store a path belongs to, for routing download/evict.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CloudKind {
+    /// iCloud Drive — full download + evict via Foundation.
+    ICloud,
+    /// A third-party File Provider store (Dropbox, Google Drive, OneDrive, …) —
+    /// download works when the provider is running; evict is provider-driven.
+    Provider,
 }
 
 /// Update-check state shared between the Settings window (which drives the
@@ -3834,6 +3900,7 @@ impl Shuffle {
             waterfall_children: HashMap::new(),
             waterfall_pending: HashSet::new(),
             waterfall_mtime: HashMap::new(),
+            cloud_busy: HashSet::new(),
         }
     }
 
@@ -4497,10 +4564,38 @@ impl Shuffle {
         self.begin_rename(pane, path, window, cx);
     }
 
+    /// Quick Look the current selection (spacebar), like Finder. Uses macOS
+    /// `qlmanage -p`, which pops the system preview panel. Local files only —
+    /// remote (SFTP) items aren't on disk for QuickLook to read.
+    fn quick_look(&self, pane: usize) {
+        if self.tab(pane).remote.is_some() {
+            return;
+        }
+        let mut paths: Vec<PathBuf> = self.tab(pane).selection.iter().cloned().collect();
+        if paths.is_empty() {
+            if let Some(a) = self.tab(pane).anchor.clone() {
+                paths.push(a);
+            }
+        }
+        if paths.is_empty() {
+            return;
+        }
+        paths.sort();
+        let _ = Command::new("qlmanage")
+            .arg("-p")
+            .args(&paths)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+
     fn open_path(&mut self, pane: usize, path: PathBuf, is_dir: bool, cx: &mut Context<Self>) {
-        if is_dir {
+        // App bundles are directories, but double-clicking one should *launch*
+        // it like Finder — browse inside via right-click → Show Package Contents.
+        let is_app = is_dir && path.extension().is_some_and(|e| e == "app");
+        if is_dir && !is_app {
             self.navigate_in(pane, path, cx);
-        } else if self.tab(pane).remote.is_some() {
+        } else if !is_app && self.tab(pane).remote.is_some() {
             // Remote file → download to ~/Downloads, then open it.
             self.download_remote(pane, path, None, true, cx);
         } else {
@@ -5801,6 +5896,108 @@ impl Shuffle {
         .detach();
     }
 
+    /// The badge state for an item: syncing if a download/evict is in flight,
+    /// online-only if it's a cloud placeholder, else local (no badge). Only
+    /// files under a cloud root are stat'd (cheap, cached) — everything else is
+    /// free.
+    fn cloud_state(&self, path: &Path, is_dir: bool) -> CloudSync {
+        if self.cloud_busy.contains(path) {
+            return CloudSync::Syncing;
+        }
+        if !is_dir && cloud_kind(path).is_some() && cached_dataless(path) {
+            return CloudSync::OnlineOnly;
+        }
+        CloudSync::Local
+    }
+
+    /// Download (materialize) online-only cloud files to disk. `path` may be a
+    /// file or a folder (downloads its online-only descendants). Runs the
+    /// `cloudctl` helper per file in the background; badges show ↻ meanwhile.
+    fn cloud_download(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
+        self.close_context_menu(cx);
+        let Some(tool) = cloudctl_path() else { return };
+        // Gather the online-only files to fetch (the file itself, or a folder's
+        // dataless descendants — capped so a giant tree can't spawn thousands).
+        let targets = collect_cloud_files(&path, /* want_dataless */ true, 2000);
+        if targets.is_empty() {
+            return;
+        }
+        for t in &targets {
+            self.cloud_busy.insert(t.clone());
+        }
+        cx.notify();
+        let dir = self.tab(pane).current_dir.clone();
+        cx.spawn(async move |this, cx| {
+            let done = targets.clone();
+            cx.background_spawn(async move {
+                for f in &targets {
+                    let _ = Command::new(&tool).arg("download").arg(f).status();
+                }
+            })
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                for f in &done {
+                    this.cloud_busy.remove(f);
+                }
+                // Re-read the folder so freshly-materialized files lose the badge.
+                if this.tab(pane).current_dir == dir {
+                    this.refresh_pane(pane, cx);
+                } else {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Free up space: evict downloaded cloud files back to online-only. iCloud
+    /// only (third-party eviction is driven by the provider's own app). `path`
+    /// may be a file or a folder (evicts its materialized descendants).
+    fn cloud_evict(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
+        self.close_context_menu(cx);
+        let Some(tool) = cloudctl_path() else { return };
+        let targets = collect_cloud_files(&path, /* want_dataless */ false, 5000);
+        if targets.is_empty() {
+            return;
+        }
+        for t in &targets {
+            self.cloud_busy.insert(t.clone());
+        }
+        cx.notify();
+        let dir = self.tab(pane).current_dir.clone();
+        cx.spawn(async move |this, cx| {
+            let all = targets.clone();
+            let err = cx
+                .background_spawn(async move {
+                    let mut last_err = None;
+                    for f in &targets {
+                        let out = Command::new(&tool).arg("evict").arg(f).output();
+                        if let Ok(o) = out {
+                            if !o.status.success() {
+                                last_err = Some(String::from_utf8_lossy(&o.stderr).trim().to_string());
+                            }
+                        }
+                    }
+                    last_err
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                for f in &all {
+                    this.cloud_busy.remove(f);
+                }
+                if let Some(e) = err.filter(|e| !e.is_empty()) {
+                    this.remote_error = Some(e);
+                }
+                if this.tab(pane).current_dir == dir {
+                    this.refresh_pane(pane, cx);
+                } else {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Set the file as the desktop picture on every display (Service).
     fn set_desktop_picture(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let script = format!(
@@ -5875,6 +6072,34 @@ impl Shuffle {
                     }))
                     .into_any_element(),
                 );
+            }
+            // Cloud storage: download-on-demand / free up space. Offered for
+            // files/folders in a cloud store, when the helper is present.
+            if let (Some(kind), true) = (cloud_kind(&path), cloudctl_path().is_some()) {
+                let has_online = collect_cloud_files(&path, true, 1).len() == 1;
+                let has_local = collect_cloud_files(&path, false, 1).len() == 1;
+                if has_online {
+                    let label = if is_dir { "Download Contents" } else { "Download Now" };
+                    let p = path.clone();
+                    items.push(
+                        ctx_item(label, cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.cloud_download(pane, p.clone(), cx);
+                        }))
+                        .into_any_element(),
+                    );
+                }
+                // Eviction is iCloud-only here (third-party is provider-driven).
+                if has_local && kind == CloudKind::ICloud {
+                    let label = if is_dir { "Free Up Space in Folder" } else { "Free Up Space" };
+                    let p = path.clone();
+                    items.push(
+                        ctx_item(label, cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.cloud_evict(pane, p.clone(), cx);
+                        }))
+                        .into_any_element(),
+                    );
+                }
+
             }
             // Type-specific actions, Finder-style: archives extract in place,
             // app bundles reveal their contents.
@@ -8123,6 +8348,11 @@ impl Shuffle {
                     self.arrow_move(pane, dx, dy, cx);
                     return;
                 }
+                // Spacebar → Quick Look the selection, like Finder.
+                if key == "space" {
+                    self.quick_look(pane);
+                    return;
+                }
             }
             // Enter renames the item under the mouse first (point-and-rename),
             // else the focused one (Finder-style; not rebindable). The hover
@@ -8625,8 +8855,9 @@ impl Shuffle {
             .flex()
             .flex_col()
             .overflow_hidden()
-            // ~75% opaque so the explorer shows faintly through the menu.
-            .bg(Theme::alpha(t.surface, 0xbf))
+            // Opacity is user-configurable (Settings → Appearance); default is
+            // nearly opaque so the palette doesn't read as a confusing overlay.
+            .bg(Theme::alpha(t.surface, palette_alpha()))
             .rounded_lg()
             .border_1()
             .border_color(rgb(t.border_strong))
@@ -10563,6 +10794,7 @@ impl Shuffle {
             .border_color(rgb(t.border))
             .child(
                 div()
+                    .flex_none()
                     .text_color(rgb(t.text))
                     .truncate()
                     .child(path_label(&sel)),
@@ -10594,11 +10826,16 @@ impl Shuffle {
             };
             let preview_box = div()
                 .relative()
+                .flex_none()
                 .flex()
                 .items_center()
                 .justify_center()
                 .w_full()
                 .min_h(px(120.0))
+                // Clip so a tall preview can't paint over the title above or the
+                // "Information" section below.
+                .max_h(px(380.0))
+                .overflow_hidden()
                 .p_2()
                 .rounded_md()
                 // White "page" so document/text previews (black text, often
@@ -12102,7 +12339,7 @@ impl Shuffle {
     fn render_view_toolbar(&self, pane: usize, cx: &Context<Self>) -> impl IntoElement {
         let t = theme();
         let view = self.tab(pane).view;
-        let btn = |id: &'static str, glyph: &'static str, mode: ViewMode, cx: &Context<Self>| {
+        let btn = |id: &'static str, glyph: &'static str, name: &'static str, mode: ViewMode, cx: &Context<Self>| {
             let on = view == mode;
             div()
                 .id((id, pane)) // ids must be unique per pane, or only one pane works
@@ -12118,6 +12355,7 @@ impl Shuffle {
                 .when(on, |s| s.bg(rgb(t.surface)))
                 .hover(|s| s.bg(rgb(t.hover)))
                 .child(glyph)
+                .tooltip(tip(name))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.set_view(pane, mode, cx);
                 }))
@@ -12137,37 +12375,31 @@ impl Shuffle {
             .text_color(rgb(t.text_dim))
             .hover(|s| s.bg(rgb(t.hover)).text_color(rgb(t.text)))
             .child("🔍")
+            .tooltip(tip("Search (⌘P)"))
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.active_pane = pane;
                 if !this.palette_open {
                     this.toggle_palette(window, cx);
                 }
             }));
-        div()
+        // Sort has no effect in Column view (columns are always folders-first,
+        // by name), so grey it out and make it inert there rather than misleading.
+        let sort_enabled = view != ViewMode::Columns;
+        let sort_btn = div()
+            .id(("sort-by", pane))
             .flex_none()
+            .px_2()
+            .h(px(22.0))
             .flex()
             .items_center()
-            .gap_1()
-            .pl_2()
-            .child(search_btn)
-            .child(btn("view-list", "☰", ViewMode::List, cx))
-            .child(btn("view-icons", "▦", ViewMode::Icons, cx))
-            .child(btn("view-columns", "▥", ViewMode::Columns, cx))
-            .child(btn("view-gallery", "▭", ViewMode::Gallery, cx))
-            .child(
-                // Sort-By button — opens a dropdown at the click location.
-                div()
-                    .id(("sort-by", pane))
-                    .flex_none()
-                    .px_2()
-                    .h(px(22.0))
-                    .flex()
-                    .items_center()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .text_color(rgb(t.text_dim))
+            .rounded_md()
+            .when(sort_enabled, |d| d.text_color(rgb(t.text_dim)))
+            .when(!sort_enabled, |d| d.text_color(Theme::alpha(t.text_dim, 0x66)))
+            .child("⇅")
+            .tooltip(tip(if sort_enabled { "Sort By" } else { "Sort By (not available in Column view)" }))
+            .when(sort_enabled, |d| {
+                d.cursor_pointer()
                     .hover(|s| s.bg(rgb(t.hover)).text_color(rgb(t.text)))
-                    .child("⇅")
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
@@ -12179,8 +12411,20 @@ impl Shuffle {
                             cx.stop_propagation();
                             cx.notify();
                         }),
-                    ),
-            )
+                    )
+            });
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_1()
+            .pl_2()
+            .child(search_btn)
+            .child(btn("view-list", "☰", "List view", ViewMode::List, cx))
+            .child(btn("view-icons", "▦", "Icon view", ViewMode::Icons, cx))
+            .child(btn("view-columns", "▥", "Column view", ViewMode::Columns, cx))
+            .child(btn("view-gallery", "▭", "Gallery view", ViewMode::Gallery, cx))
+            .child(sort_btn)
     }
 
     /// Clickable breadcrumb for a pane. Segments up to and including the current
@@ -12780,6 +13024,7 @@ impl Shuffle {
                             let modified = entry.modified;
                             let entry_loaded = entry.loaded;
                             let target = base_dir.join(&name);
+                            let cloud = this.cloud_state(&target, is_dir);
                             let ctx_target = target.clone();
                             let drop_target = target.clone();
                             let hover_target = target.clone();
@@ -12799,7 +13044,7 @@ impl Shuffle {
                             } else {
                                 Some(target.clone())
                             };
-                            let icon = icon_element(&target, is_dir);
+                            let icon = cloud_badged_icon(icon_element(&target, is_dir), cloud, 11.0);
 
                             items.push(
                                 file_row(
@@ -13045,6 +13290,7 @@ impl Shuffle {
             let display_name = single_line_name(&name);
             let is_dir = entry.is_dir;
             let target = pane_dir.join(&name);
+            let cloud = self.cloud_state(&target, is_dir);
             let selected = tab.selection.contains(&target);
             let nav_t = target.clone();
             let press_t = target.clone();
@@ -13073,7 +13319,7 @@ impl Shuffle {
                             cx.stop_propagation();
                         }),
                     )
-                    .child(icon_element_sized(&target, is_dir, 44.0))
+                    .child(cloud_badged_icon(icon_element_sized(&target, is_dir, 44.0), cloud, 16.0))
                     .child(
                         div()
                             .w_full()
@@ -13083,6 +13329,7 @@ impl Shuffle {
                             .text_color(rgb(t.text_muted))
                             .child(display_name),
                     )
+
                     .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
                         this.click_entry(pane, nav_t.clone(), is_dir, ev, cx);
                     }))
@@ -14220,6 +14467,95 @@ fn removebg_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let cand = exe.parent()?.join("removebg");
     cand.exists().then_some(cand)
+}
+
+/// Path to the bundled `cloudctl` Swift helper (download/evict cloud files).
+fn cloudctl_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let cand = exe.parent()?.join("cloudctl");
+    cand.exists().then_some(cand)
+}
+
+/// Which cloud store `path` lives in, or `None` if it isn't under one. iCloud
+/// Drive is `~/Library/Mobile Documents`; third-party File Provider stores live
+/// under `~/Library/CloudStorage`.
+fn cloud_kind(path: &Path) -> Option<CloudKind> {
+    let home = home_dir();
+    if path.starts_with(home.join("Library/Mobile Documents")) {
+        return Some(CloudKind::ICloud);
+    }
+    if path.starts_with(home.join("Library/CloudStorage")) {
+        return Some(CloudKind::Provider);
+    }
+    None
+}
+
+/// Whether `path` is an online-only cloud placeholder (kernel `SF_DATALESS`).
+fn is_dataless(path: &Path) -> bool {
+    use std::os::macos::fs::MetadataExt;
+    fs::metadata(path)
+        .map(|m| m.st_flags() & SF_DATALESS != 0)
+        .unwrap_or(false)
+}
+
+/// `SF_DATALESS` cache for render, keyed by path with a short TTL. The flag
+/// isn't reliably captured during bulk directory enumeration (it lags on a
+/// background thread), so the badge reads it lazily here instead. The stat is a
+/// local metadata read (cloud placeholders live on-disk; only their bytes are
+/// remote), so it's fast on the main thread — no network blocking like a dead
+/// mount, hence no background dance.
+static DATALESS_STAT: OnceLock<Mutex<HashMap<PathBuf, (bool, Instant)>>> = OnceLock::new();
+
+fn cached_dataless(path: &Path) -> bool {
+    const TTL: Duration = Duration::from_secs(3);
+    let map = DATALESS_STAT.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some((v, at)) = map.lock().unwrap().get(path).copied() {
+        if at.elapsed() <= TTL {
+            return v;
+        }
+    }
+    let v = is_dataless(path);
+    map.lock().unwrap().insert(path.to_path_buf(), (v, Instant::now()));
+    v
+}
+
+/// Files to act on for a cloud download/evict: `path` itself when it's a file,
+/// or the matching descendants when it's a folder. `want_dataless` selects
+/// online-only files (download) or materialized ones (evict). Capped at `cap`
+/// so a huge tree can't spawn an unbounded number of helper calls.
+fn collect_cloud_files(path: &Path, want_dataless: bool, cap: usize) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    if path.is_file() {
+        if is_dataless(path) == want_dataless {
+            out.push(path.to_path_buf());
+        }
+        return out;
+    }
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if out.len() >= cap {
+            break;
+        }
+        let Ok(rd) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            if out.len() >= cap {
+                break;
+            }
+            match e.file_type() {
+                Ok(t) if t.is_dir() => stack.push(e.path()),
+                Ok(t) if t.is_file() => {
+                    let p = e.path();
+                    if is_dataless(&p) == want_dataless {
+                        out.push(p);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
 }
 
 /// Installed terminal emulators, for the "Open in …" services.
@@ -15403,6 +15739,48 @@ fn kind_label(name: &str, is_dir: bool) -> String {
 /// emoji (per design — folder icon stays as-is for now).
 fn icon_element(path: &Path, is_dir: bool) -> AnyElement {
     icon_element_sized(path, is_dir, 16.0)
+}
+
+/// Wrap a file icon with a small corner badge showing its cloud-sync state:
+/// a cloud for online-only files, a rotating arrow while downloading. Local
+/// (fully-present) files get no badge. `badge` is the badge diameter in px.
+fn cloud_badged_icon(icon: AnyElement, cloud: CloudSync, badge: f32) -> AnyElement {
+    if cloud == CloudSync::Local {
+        return icon;
+    }
+    let t = theme();
+    // A small corner chip. `☁`/`↻` aren't in the UI font (they render blank),
+    // so use a solid colored disc with a glyph the app already draws: `▾`
+    // (points down = "download this") in blue for online-only, amber while a
+    // download/evict is in flight. A ring in the surface color separates it.
+    let (bg, glyph) = match cloud {
+        CloudSync::OnlineOnly => (0x3b82f6u32, "\u{25BE}"), // blue ▾ — online-only
+        CloudSync::Syncing => (0xf59e0bu32, "\u{25BE}"),    // amber ▾ — working
+        CloudSync::Local => unreachable!(),
+    };
+    div()
+        .relative()
+        .flex()
+        .child(icon)
+        .child(
+            div()
+                .absolute()
+                .bottom(px(-3.0))
+                .right(px(-4.0))
+                .w(px(badge))
+                .h(px(badge))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(rgb(bg))
+                .border_1()
+                .border_color(rgb(t.bg))
+                .text_size(px(badge * 0.64))
+                .text_color(rgb(0xffffff))
+                .child(glyph),
+        )
+        .into_any_element()
 }
 
 /// Like [`icon_element`] but at an explicit pixel size (for the icon/gallery views).
@@ -19065,8 +19443,9 @@ fn save_prefs(p: &Prefs) {
             let _ = fs::create_dir_all(parent);
         }
         let body = format!(
-            "terminal={}\nterm_history={}\npreview={}\npreview_pages={}\ninfo={}\nshow_parent={}\nshow_hidden={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_filter_button={}\nshow_fps={}\nscript_actions={}\nssh_use_system={}\nssh_configured={}\nwaterfall={}\n",
-            p.terminal, p.term_history, p.preview, p.preview_pages, p.info, p.show_parent, p.show_hidden, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_filter_button, p.show_fps, p.script_actions, p.ssh_use_system, p.ssh_configured, p.waterfall
+            "terminal={}\nterm_history={}\npreview={}\npreview_pages={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_filter_button={}\nshow_fps={}\nscript_actions={}\nssh_use_system={}\nssh_configured={}\nwaterfall={}\npalette_opacity={}\n",
+            p.terminal, p.term_history, p.preview, p.preview_pages, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_filter_button, p.show_fps, p.script_actions, p.ssh_use_system, p.ssh_configured, p.waterfall, p.palette_opacity
+
         );
         let _ = fs::write(&file, body);
     }
@@ -19209,6 +19588,11 @@ fn load_prefs() -> Prefs {
                     "ssh_use_system" => p.ssh_use_system = on,
                     "ssh_configured" => p.ssh_configured = on,
                     "waterfall" => p.waterfall = on,
+                    "palette_opacity" => {
+                        if let Ok(n) = v.trim().parse::<u8>() {
+                            p.palette_opacity = n.clamp(40, 100);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -19372,6 +19756,25 @@ fn main() {
                 }
             }
             Err(e) => eprintln!("download error: {e}"),
+        }
+        return;
+    }
+
+    if args.len() >= 3 && args[1] == "--cloud-test" {
+        use std::os::macos::fs::MetadataExt;
+        let p = PathBuf::from(&args[2]);
+        match fs::metadata(&p) {
+            Ok(m) => {
+                let flags = m.st_flags();
+                eprintln!("st_flags = 0x{flags:08X}");
+                eprintln!("SF_DATALESS set = {}", flags & SF_DATALESS != 0);
+                eprintln!("is_dataless() = {}", is_dataless(&p));
+                eprintln!("cloud_kind = {:?}", cloud_kind(&p).map(|k| match k {
+                    CloudKind::ICloud => "iCloud",
+                    CloudKind::Provider => "Provider",
+                }));
+            }
+            Err(e) => eprintln!("stat error: {e}"),
         }
         return;
     }
