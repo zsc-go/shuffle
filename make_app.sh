@@ -24,6 +24,16 @@ else
 fi
 cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
+# Bundle the 7-Zip CLI (official 7zz, universal arm64+x86_64, LGPL) next to the
+# main binary. It is the default compress format (.7z) and also extracts .7z.
+if [ -f vendor/7z-mac.tar.xz ]; then
+    tar -xJf vendor/7z-mac.tar.xz -C "$APP/Contents/MacOS" 7zz
+    chmod +x "$APP/Contents/MacOS/7zz"
+    echo "Bundled 7zz: $(lipo -archs "$APP/Contents/MacOS/7zz" 2>/dev/null || echo unknown-arch)"
+else
+    echo "WARNING: vendor/7z-mac.tar.xz missing; compression falls back to zip"
+fi
+
 # Compile the native "Remove Background" helper (Vision framework) next to the
 # main binary, universal so it also runs on Intel. The Vision API it uses
 # (VNGenerateForegroundInstanceMaskRequest) needs macOS 14, so both slices
@@ -82,11 +92,13 @@ if security find-identity -v -p codesigning 2>/dev/null | grep -q "$SIGN_ID"; th
     # Nested executables must be signed before the enclosing application bundle.
     # Otherwise codesign refuses to seal the outer bundle.
     [ ! -f "$APP/Contents/MacOS/removebg" ] || codesign --force --sign "$SIGN_ID" "$APP/Contents/MacOS/removebg"
+    [ ! -f "$APP/Contents/MacOS/7zz" ] || codesign --force --sign "$SIGN_ID" "$APP/Contents/MacOS/7zz"
     codesign --force --sign "$SIGN_ID" --identifier com.shuffle.app "$APP"
     echo "Signed with: $SIGN_ID"
 else
     echo "WARNING: signing identity not found; falling back to ad-hoc (permissions will re-prompt)."
     [ ! -f "$APP/Contents/MacOS/removebg" ] || codesign --force --sign - "$APP/Contents/MacOS/removebg"
+    [ ! -f "$APP/Contents/MacOS/7zz" ] || codesign --force --sign - "$APP/Contents/MacOS/7zz"
     codesign --force --sign - --identifier com.shuffle.app "$APP"
 fi
 codesign -dv --verbose=2 "$APP" 2>&1 | grep -iE 'Identifier|Authority|Signature' | head -3

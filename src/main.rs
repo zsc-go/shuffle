@@ -16,7 +16,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -25,7 +25,7 @@ use gpui::{
     actions, anchored, canvas, div, ease_out_quint, img, point, prelude::*, px, relative, rgb, rgba, size,
     uniform_list, Animation, AnimationExt, AnyElement, App,
     Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, EntityInputHandler, ExternalPaths, FocusHandle, FontWeight, ImageSource,
-    KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit,
+    KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, NavigationDirection, ObjectFit,
     PathPromptOptions, Pixels, Rgba,
     RenderImage, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, TitlebarOptions,
     UTF16Selection, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
@@ -734,6 +734,12 @@ enum KeyAction {
     RevealInFinder,
     QuickLook,
     Open,
+    /// Walk the active pane's history (the mouse side-button handlers call
+    /// the same go_back/go_forward, so both input paths stay in sync).
+    Back,
+    Forward,
+    /// Go to the parent directory of the active pane (Finder: ⌘↑).
+    Up,
     // Command-palette (Cmd+P) text editing. These act only while the palette is
     // open, so they're excluded from the normal (global) key dispatch.
     PaletteCursorStart,
@@ -764,6 +770,9 @@ impl KeyAction {
         KeyAction::RevealInFinder,
         KeyAction::QuickLook,
         KeyAction::Open,
+        KeyAction::Back,
+        KeyAction::Forward,
+        KeyAction::Up,
         KeyAction::PaletteCursorStart,
         KeyAction::PaletteCursorEnd,
         KeyAction::PaletteSelectAll,
@@ -811,6 +820,9 @@ impl KeyAction {
             KeyAction::RevealInFinder => "reveal_in_finder",
             KeyAction::QuickLook => "quick_look",
             KeyAction::Open => "open",
+            KeyAction::Back => "back",
+            KeyAction::Forward => "forward",
+            KeyAction::Up => "up",
             KeyAction::PaletteCursorStart => "palette_cursor_start",
             KeyAction::PaletteCursorEnd => "palette_cursor_end",
             KeyAction::PaletteSelectAll => "palette_select_all",
@@ -841,6 +853,9 @@ impl KeyAction {
             KeyAction::RevealInFinder => "在访达中显示",
             KeyAction::QuickLook => "快速查看",
             KeyAction::Open => "打开",
+            KeyAction::Back => "后退",
+            KeyAction::Forward => "前进",
+            KeyAction::Up => "返回上级目录",
             KeyAction::PaletteCursorStart => "命令面板：光标移到开头",
             KeyAction::PaletteCursorEnd => "命令面板：光标移到末尾",
             KeyAction::PaletteSelectAll => "命令面板：全选",
@@ -861,6 +876,9 @@ impl KeyAction {
             KeyAction::Copy => Some("cmd-c"),
             KeyAction::Paste => Some("cmd-v"),
             KeyAction::QuickLook => Some("space"),
+            KeyAction::Back => Some("cmd-["),
+            KeyAction::Forward => Some("cmd-]"),
+            KeyAction::Up => Some("cmd-up"),
             KeyAction::PaletteCursorStart => Some("cmd-left"),
             KeyAction::PaletteCursorEnd => Some("cmd-right"),
             KeyAction::PaletteSelectAll => Some("cmd-a"),
@@ -1082,6 +1100,20 @@ mod shortcut_tests {
         assert!(matches!(keymap.action_for("cmd-c"), Some(KeyAction::Copy)));
         assert!(matches!(keymap.action_for("cmd-v"), Some(KeyAction::Paste)));
     }
+
+    #[test]
+    fn back_forward_match_finder_shortcuts() {
+        let keymap = Keymap::defaults();
+        assert!(matches!(keymap.action_for("cmd-["), Some(KeyAction::Back)));
+        assert!(matches!(keymap.action_for("cmd-]"), Some(KeyAction::Forward)));
+        assert!(keymap.action_for("cmd-[").is_some());
+    }
+
+    #[test]
+    fn up_goes_to_parent_like_finder() {
+        let keymap = Keymap::defaults();
+        assert!(matches!(keymap.action_for("cmd-up"), Some(KeyAction::Up)));
+    }
 }
 
 #[cfg(test)]
@@ -1103,6 +1135,51 @@ mod file_selection_tests {
         let paths = [PathBuf::from("a"), PathBuf::from("b")];
         let selected = contiguous_selection(&paths, Some(Path::new("gone")), Path::new("b"));
         assert_eq!(selected, [PathBuf::from("b")].into_iter().collect());
+    }
+
+    #[test]
+    fn compress_uses_selection_when_clicked_item_is_part_of_it() {
+        let selection = ["a", "b", "c"].into_iter().map(PathBuf::from).collect();
+        let visible = ["a", "b", "c"].into_iter().map(PathBuf::from).collect::<Vec<_>>();
+        let targets = compress_targets(&selection, &visible, Path::new("b"));
+        assert_eq!(
+            targets,
+            ["a", "b", "c"].into_iter().map(PathBuf::from).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn compress_targets_only_the_clicked_item_when_selection_is_single() {
+        let selection = [PathBuf::from("b")].into_iter().collect();
+        let visible = ["a", "b"].into_iter().map(PathBuf::from).collect::<Vec<_>>();
+        let targets = compress_targets(&selection, &visible, Path::new("b"));
+        assert_eq!(targets, vec![PathBuf::from("b")]);
+    }
+
+    #[test]
+    fn compress_ignores_stale_selection_when_clicking_an_unselected_item() {
+        let selection = ["a", "b"].into_iter().map(PathBuf::from).collect();
+        let visible = ["a", "b", "c"].into_iter().map(PathBuf::from).collect::<Vec<_>>();
+        let targets = compress_targets(&selection, &visible, Path::new("c"));
+        assert_eq!(targets, vec![PathBuf::from("c")]);
+    }
+
+    #[test]
+    fn archive_base_names_single_item_after_itself_else_archive() {
+        let a = PathBuf::from("foo");
+        let b = PathBuf::from("bar");
+        assert_eq!(archive_base(&[a.clone()]), "foo");
+        assert_eq!(archive_base(&[a.clone(), b.clone()]), "Archive");
+        assert_eq!(archive_base(&[PathBuf::from("foo.txt")]), "foo");
+    }
+
+    #[test]
+    fn parse_percent_reads_trailing_percentage() {
+        assert_eq!(parse_percent("\r  47%  big.bin"), Some(47));
+        assert_eq!(parse_percent("  100%"), Some(100));
+        assert_eq!(parse_percent("0%\n"), Some(0));
+        assert_eq!(parse_percent("no number here"), None);
+        assert_eq!(parse_percent(""), None);
     }
 }
 
@@ -2839,6 +2916,10 @@ const SIDEBAR_COLLAPSED_W: f32 = 52.0;
 const TITLEBAR_H: f32 = 34.0;
 /// Tab strip row height.
 const TAB_H: f32 = 30.0;
+/// Keep tab targets easy to click while preventing a long folder name from
+/// consuming the entire tab strip. The label itself still truncates.
+const TAB_MIN_W: f32 = 96.0;
+const TAB_MAX_W: f32 = 180.0;
 /// Fixed list-row height (so marquee selection can map y-coordinates to rows).
 const ROW_H: f32 = 24.0;
 /// Overlay scrollbar: stays solid this long after the last scroll…
@@ -3088,6 +3169,10 @@ enum SidebarTarget {
     GroupMember(usize, PathBuf),
     /// A saved SFTP server → offer "Edit…" / "Remove".
     Sftp(SftpServer),
+    /// Right-clicked the 中转站 header → offer "Clear".
+    StagingHeader,
+    /// Right-clicked a 中转站 item (path) → offer "Remove from staging".
+    StagingItem(PathBuf),
 }
 
 /// One row in the command palette: a title, a gray subtitle (full path), and
@@ -3286,8 +3371,8 @@ impl Tab {
             selection: HashSet::new(),
             anchor: None,
             selection_anchor: None,
-            sort_key: SortKey::None,
-            sort_asc: true,
+            sort_key: SortKey::Modified,
+            sort_asc: false,
             view: ViewMode::List,
             col_chain: Vec::new(),
             col_active: 0,
@@ -3479,6 +3564,16 @@ struct Shuffle {
     drop_hover: Option<(usize, Option<usize>)>,
     /// Last SFTP error (connection/listing), shown as a banner until cleared.
     remote_error: Option<String>,
+    /// In-flight background job (banner under the titlebar).
+    busy: Option<BusyState>,
+    /// Bumped on every job start so a stale worker can't clear a newer banner.
+    busy_gen: u64,
+    /// File paths currently staged in the 中转站 (real copies in the staging
+    /// folder — survives restarts).
+    staging: Vec<PathBuf>,
+    /// Left-press origin for a staging drag: (paths to drag, (x, y)). Dragging
+    /// out MOVES the files out of the staging folder to the drop target.
+    staging_drag: Option<(Vec<PathBuf>, (f32, f32))>,
     /// Waterfall sidebar tree: which folders are expanded, their cached child
     /// subfolders, and which are being loaded (to avoid duplicate reads).
     waterfall_expanded: HashSet<PathBuf>,
@@ -3519,6 +3614,16 @@ enum UpdateStatus {
     Downloading(String),
     /// The install couldn't complete; carries a short reason.
     Failed(String),
+}
+
+/// An in-flight background operation (compress, extract, paste, upload, …),
+/// shown as a slim banner under the titlebar while it runs.
+#[derive(Clone)]
+struct BusyState {
+    /// Text shown to the user, e.g. "正在压缩 Archive.7z".
+    label: String,
+    /// Live percentage, if the backend reports one (None = unknown).
+    percent: Option<u32>,
 }
 
 impl Shuffle {
@@ -3721,6 +3826,10 @@ impl Shuffle {
             hovered: None,
             drop_hover: None,
             remote_error: None,
+            busy: None,
+            busy_gen: 0,
+            staging: staged_paths(),
+            staging_drag: None,
             waterfall_expanded: HashSet::new(),
             waterfall_children: HashMap::new(),
             waterfall_pending: HashSet::new(),
@@ -4168,13 +4277,18 @@ impl Shuffle {
 
     /// Run a remote operation off-thread, then reload the pane (or show the
     /// error). The closure captures the server + parameters it needs.
-    fn run_remote<F>(&mut self, pane: usize, op: F, cx: &mut Context<Self>)
+    fn run_remote<F>(&mut self, pane: usize, label: String, op: F, cx: &mut Context<Self>)
     where
         F: FnOnce() -> Result<(), String> + Send + 'static,
     {
+        let gen = self.begin_busy(label);
         cx.spawn(async move |this, cx| {
             let result = cx.background_spawn(async move { op() }).await;
             let _ = this.update(cx, |this, cx| {
+                if this.busy_gen != gen {
+                    return;
+                }
+                this.busy = None;
                 match result {
                     Ok(()) => {
                         this.remote_error = None;
@@ -4259,8 +4373,10 @@ impl Shuffle {
         };
         let dir = remote_dir.to_string_lossy().into_owned();
         let use_system = prefs().ssh_use_system;
+        let n = locals.len();
         self.run_remote(
             pane,
+            format!("正在上传 {n} 个项目到服务器"),
             move || {
                 for local in &locals {
                     sftp_upload(&server, local, &dir, use_system)?;
@@ -4413,6 +4529,7 @@ impl Shuffle {
         let local = unique_child(&dest_dir, &name);
         let remote = remote_path.to_string_lossy().into_owned();
         let use_system = prefs().ssh_use_system;
+        let gen = self.begin_busy(format!("正在下载 {name}"));
         cx.spawn(async move |this, cx| {
             let s = server.clone();
             let r = remote.clone();
@@ -4430,6 +4547,10 @@ impl Shuffle {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                if this.busy_gen != gen {
+                    return;
+                }
+                this.busy = None;
                 match result {
                     Ok(local) => {
                         this.remote_error = None;
@@ -4488,8 +4609,10 @@ impl Shuffle {
                 let use_system = prefs().ssh_use_system;
                 let remote_paths: Vec<String> =
                     paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                let n = paths.len();
                 self.run_remote(
                     pane,
+                    format!("正在从服务器删除 {n} 个项目"),
                     move || {
                         for rp in &remote_paths {
                             sftp_delete(&server, rp, use_system)?;
@@ -4734,6 +4857,7 @@ impl Shuffle {
                         .await;
                     let _ = this.update(cx, |this, cx| {
                         this.remote_error = result.err();
+                        this.refresh_staging();
                         this.refresh_all_panes(cx);
                     });
                 })
@@ -4764,6 +4888,7 @@ impl Shuffle {
                     });
                 } else {
                     self.remote_error = result.err();
+                    self.refresh_staging();
                     self.refresh_all_panes(cx);
                     cx.notify();
                 }
@@ -4848,8 +4973,14 @@ impl Shuffle {
                         let from = r.path.to_string_lossy().into_owned();
                         let to = dest.to_string_lossy().into_owned();
                         let pane = r.pane;
+                        let rname = r
+                            .path
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "远程项目".into());
                         self.run_remote(
                             pane,
+                            format!("正在重命名 {rname}"),
                             move || sftp_rename(&server, &from, &to, use_system),
                             cx,
                         );
@@ -5068,7 +5199,8 @@ impl Shuffle {
         }
     }
 
-    /// Duplicate a file/folder as "name copy" (Finder-style), recursively.
+    /// Duplicate a file/folder as "name copy" (Finder-style), recursively,
+    /// off the UI thread so a big folder can't freeze the listing.
     fn duplicate_entry(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
         let Some(parent) = path.parent() else { return };
         let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -5078,8 +5210,19 @@ impl Shuffle {
             None => format!("{stem} copy"),
         };
         let dest = unique_child(parent, &base);
-        let _ = Command::new("cp").arg("-R").arg(&path).arg(&dest).status();
-        self.refresh_pane(pane, cx);
+        let dest_name = dest
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let gen = self.begin_busy(format!("正在制作副本 {dest_name}"));
+        cx.spawn(async move |this, cx| {
+            cx.background_spawn(async move {
+                let _ = Command::new("cp").arg("-R").arg(&path).arg(&dest).status();
+            })
+            .await;
+            let _ = this.update(cx, |this, cx| this.end_busy(gen, pane, cx));
+        })
+        .detach();
     }
 
     /// Copy the active pane's selection as native macOS file URLs. Finder and
@@ -5124,34 +5267,70 @@ impl Shuffle {
             return;
         }
 
+        let total = sources.len() as u32;
+        let gen = self.begin_busy(format!("正在粘贴 {total} 个项目"));
+        // Paste iterates per item; mirror "done / total" into the banner real-time.
+        let done = Arc::new(AtomicU32::new(0));
+        let done_w = done.clone();
         cx.spawn(async move |this, cx| {
-            let failure = cx
-                .background_spawn(async move {
-                    for source in sources {
-                        if !source.exists() || (source.is_dir() && dest_dir.starts_with(&source)) {
-                            continue;
+            let paste = cx.background_spawn(async move {
+                let mut i = 0u32;
+                for source in sources {
+                    i += 1;
+                    if !source.exists() || (source.is_dir() && dest_dir.starts_with(&source)) {
+                        continue;
+                    }
+                    let Some(destination) = paste_destination(&source, &dest_dir) else {
+                        continue;
+                    };
+                    match Command::new("ditto").arg(&source).arg(&destination).status() {
+                        Ok(status) if status.success() => {}
+                        Ok(status) => {
+                            return Some(format!(
+                                "Paste failed for {} (exit {})",
+                                source.display(),
+                                status.code().unwrap_or(-1)
+                            ));
                         }
-                        let Some(destination) = paste_destination(&source, &dest_dir) else {
-                            continue;
-                        };
-                        match Command::new("ditto").arg(&source).arg(&destination).status() {
-                            Ok(status) if status.success() => {}
-                            Ok(status) => {
-                                return Some(format!(
-                                    "Paste failed for {} (exit {})",
-                                    source.display(),
-                                    status.code().unwrap_or(-1)
-                                ));
-                            }
-                            Err(error) => {
-                                return Some(format!("Paste failed for {}: {error}", source.display()));
-                            }
+                        Err(error) => {
+                            return Some(format!("Paste failed for {}: {error}", source.display()));
                         }
                     }
-                    None
-                })
-                .await;
+                    done.store(i, Ordering::Relaxed);
+                }
+                None
+            });
+            // Feed the banner while the paste runs.
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
+                let d = done_w.load(Ordering::Relaxed);
+                if d >= total {
+                    break;
+                }
+                let mut alive = false;
+                alive = this
+                    .update(cx, |this, cx| {
+                        if this.busy_gen != gen {
+                            return;
+                        }
+                        if let Some(b) = this.busy.as_mut() {
+                            b.percent = (total > 0).then_some((d * 100 / total).min(99));
+                            cx.notify();
+                        }
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+            let failure = paste.await;
             let _ = this.update(cx, |this, cx| {
+                if this.busy_gen != gen {
+                    return;
+                }
+                this.busy = None;
                 if pane < this.panes.len() {
                     this.remote_error = failure;
                     this.refresh_pane(pane, cx);
@@ -5173,27 +5352,284 @@ impl Shuffle {
         self.refresh_pane(pane, cx);
     }
 
-    /// Compress a file/folder into a `.zip` beside it (Finder uses `ditto`).
-    /// Zip a file/folder beside itself, off-thread so a big folder can't
-    /// freeze the UI while `ditto` runs.
+    /// Compress the clicked/anchored path — or, when it is part of a
+    /// multi-item selection, the whole selection — into one archive beside it
+    /// (Finder behavior: “Compress N Items”). Default format is 7z via the
+    /// bundled 7zz binary, falling back to zip. Runs off-thread so a big
+    /// folder can't freeze the UI; a slim banner shows live progress while 7zz
+    /// reports percentages, otherwise an indeterminate “compressing…” note.
     fn compress_entry(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
-        let Some(parent) = path.parent() else { return };
-        let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        let dest = unique_child(parent, &format!("{stem}.zip"));
+        let paths = compress_targets(&self.tab(pane).selection, &self.display_paths(pane), &path);
+        if paths.is_empty() {
+            return;
+        }
+        let Some(parent) = paths[0].parent() else { return };
+        let base = archive_base(&paths);
+        let seven_zip = seven_zip_path();
+        let ext = if seven_zip.is_some() { "7z" } else { "zip" };
+        let dest = unique_child(parent, &format!("{base}.{ext}"));
+        let label = dest
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let gen = self.begin_busy(format!("正在压缩 {label}"));
+
+        let Some(zz) = seven_zip else {
+            self.compress_without_progress(pane, gen, dest, paths, cx);
+            return;
+        };
+
+        // 7zz streams "\r  47%" progress lines to stdout with -bsp1; read them
+        // on a worker thread and mirror the percentage into the banner.
+        let pct = Arc::new(AtomicU32::new(255)); // 255 = no reading yet
+        let done = Arc::new(AtomicBool::new(false));
+        let pct_w = pct.clone();
+        let done_w = done.clone();
+        let argv = paths.clone();
+        let dst = dest.clone();
+        let worker = cx.background_executor().spawn(async move {
+            let mut child = match Command::new(&zz)
+                .arg("a")
+                .arg("-bsp1")
+                .arg("-bso0")
+                .arg(&dst)
+                .args(&argv)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(_) => {
+                    pct_w.store(100, Ordering::Relaxed);
+                    done_w.store(true, Ordering::Relaxed);
+                    return;
+                }
+            };
+            let mut out = BufReader::new(child.stdout.take().expect("piped stdout"));
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match out.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if let Some(p) = parse_percent(&line) {
+                            pct_w.store(p, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+            let _ = child.wait();
+            pct_w.store(100, Ordering::Relaxed);
+            done_w.store(true, Ordering::Relaxed);
+        });
+
         cx.spawn(async move |this, cx| {
-            cx.background_spawn(async move {
-                let _ = Command::new("ditto")
-                    .args(["-c", "-k", "--sequesterRsrc", "--keepParent"])
-                    .arg(&path)
-                    .arg(&dest)
-                    .status();
-            })
-            .await;
-            let _ = this.update(cx, |this, cx| {
+            while !done.load(Ordering::Relaxed) {
+                cx.background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
+                let p = pct.load(Ordering::Relaxed);
+                this.update(cx, |this, cx| {
+                    if this.busy_gen != gen {
+                        return;
+                    }
+                    if let Some(b) = this.busy.as_mut() {
+                        b.percent = (p != 255).then_some(p.min(100));
+                    }
+                    cx.notify();
+                })
+                .ok();
+            }
+            let _ = worker.await;
+            this.update(cx, |this, cx| {
+                if this.busy_gen != gen {
+                    return;
+                }
+                this.busy = None;
                 if pane < this.panes.len() {
                     this.refresh_pane(pane, cx);
                 }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Show the busy banner (returning a generation to match on completion,
+    /// so a stale worker can't clear a newer job's banner).
+    fn begin_busy(&mut self, label: String) -> u64 {
+        self.busy_gen += 1;
+        self.busy = Some(BusyState { label, percent: None });
+        self.busy_gen
+    }
+
+    /// Clear the busy banner and refresh `pane`, unless a newer job replaced us.
+    fn end_busy(&mut self, gen: u64, pane: usize, cx: &mut Context<Self>) {
+        if self.busy_gen != gen {
+            return;
+        }
+        self.busy = None;
+        if pane < self.panes.len() {
+            self.refresh_pane(pane, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Re-read the staging folder into `self.staging` (after stage / drag-out
+    /// / remove / clear).
+    fn refresh_staging(&mut self) {
+        self.staging = staged_paths();
+    }
+
+    /// Copy dragged-in files into the staging folder (originals stay put),
+    /// with the count driven into the busy banner. Names are made unique under
+    /// the staging folder so repeated stages don't overwrite each other.
+    fn stage_files(&mut self, srcs: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let srcs: Vec<PathBuf> = srcs.into_iter().filter(|p| p.exists()).collect();
+        if srcs.is_empty() {
+            return;
+        }
+        let dir = staging_dir();
+        let _ = fs::create_dir_all(&dir);
+        let total = srcs.len() as u32;
+        let gen = self.begin_busy(format!("正在存入中转站 {total} 个项目"));
+        let done = Arc::new(AtomicU32::new(0));
+        let done_w = done.clone();
+        cx.spawn(async move |this, cx| {
+            let worker = cx.background_spawn(async move {
+                for s in &srcs {
+                    let Some(name) = s.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                        continue;
+                    };
+                    let dest = unique_child(&dir, &name);
+                    // ditto copies files and folders (fidelity beats fs::copy).
+                    let _ = Command::new("ditto")
+                        .arg(s)
+                        .arg(&dest)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                    done.fetch_add(1, Ordering::Relaxed);
+                }
             });
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
+                let d = done_w.load(Ordering::Relaxed);
+                if d >= total {
+                    break;
+                }
+                let mut alive = false;
+                alive = this
+                    .update(cx, |this, cx| {
+                        if this.busy_gen != gen {
+                            return;
+                        }
+                        if let Some(b) = this.busy.as_mut() {
+                            b.percent = Some((d * 100 / total).min(99));
+                            cx.notify();
+                        }
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+            let _ = worker.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.busy_gen == gen {
+                    this.busy = None;
+                }
+                this.refresh_staging();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// If a left-press on a 中转站 row has moved past the drag threshold, hand
+    /// the staged paths to a native macOS drag. Dropping onto a Shuffle folder
+    /// arrives as an external-file drop that MOVES the files out of staging;
+    /// dropping into Finder copies them. Either way staging is refreshed.
+    fn maybe_start_staging_drag(&mut self, x: f32, y: f32, window: &Window, cx: &mut Context<Self>) {
+        let Some((paths, (sx, sy))) = self.staging_drag.clone() else {
+            return;
+        };
+        if (x - sx).abs() < 6.0 && (y - sy).abs() < 6.0 {
+            return; // still within click slop
+        }
+        self.staging_drag = None;
+        if paths.is_empty() {
+            return;
+        }
+        if let Some(view) = ns_view_ptr(window) {
+            start_os_file_drag(view, &paths);
+        }
+        cx.notify();
+    }
+
+    /// Remove one staged file/folder (its copy in the staging folder).
+    fn remove_staging_item(&mut self, path: &Path) {
+        let _ = if path.is_dir() {
+            fs::remove_dir_all(path)
+        } else {
+            fs::remove_file(path)
+        };
+        self.refresh_staging();
+    }
+
+    /// Empty the whole staging folder.
+    fn clear_staging(&mut self) {
+        if let Ok(rd) = fs::read_dir(staging_dir()) {
+            for e in rd.filter_map(|e| e.ok()) {
+                let path = e.path();
+                let _ = if path.is_dir() {
+                    fs::remove_dir_all(&path)
+                } else {
+                    fs::remove_file(&path)
+                };
+            }
+        }
+        self.refresh_staging();
+    }
+
+    /// Zip fallback (no 7zz on the system): same off-thread run, but the
+    /// archiver gives no progress, so the banner stays indeterminate.
+    fn compress_without_progress(
+        &mut self,
+        pane: usize,
+        gen: u64,
+        dest: PathBuf,
+        paths: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            cx.background_spawn(async move {
+                if paths.len() == 1 {
+                    // Same behavior as before: ditto keeps the item's parent
+                    // folder inside the zip (Finder-style).
+                    let _ = Command::new("ditto")
+                        .args(["-c", "-k", "--sequesterRsrc", "--keepParent"])
+                        .arg(&paths[0])
+                        .arg(&dest)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                } else {
+                    // ditto can't archive multiple sources; /usr/bin/zip can.
+                    let _ = Command::new("/usr/bin/zip")
+                        .arg("-rq")
+                        .arg(&dest)
+                        .args(&paths)
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
+            })
+            .await;
+            let _ = this.update(cx, |this, cx| this.end_busy(gen, pane, cx));
         })
         .detach();
     }
@@ -5213,21 +5649,18 @@ impl Shuffle {
             None => return,
         };
         let dest = unique_child(parent, &stem);
+        let gen = self.begin_busy(format!("正在解压 {name}"));
         cx.spawn(async move |this, cx| {
             cx.background_spawn(async move {
                 if fs::create_dir_all(&dest).is_err() {
                     return;
                 }
-                if let Some(mut c) = archive_extract_command(&path) {
-                    let _ = c.arg(&dest).stdout(Stdio::null()).stderr(Stdio::null()).status();
+                if let Some(mut c) = archive_extract_command(&path, &dest) {
+                    let _ = c.stdout(Stdio::null()).stderr(Stdio::null()).status();
                 }
             })
             .await;
-            let _ = this.update(cx, |this, cx| {
-                if pane < this.panes.len() {
-                    this.refresh_pane(pane, cx);
-                }
-            });
+            let _ = this.update(cx, |this, cx| this.end_busy(gen, pane, cx));
         })
         .detach();
     }
@@ -5344,6 +5777,7 @@ impl Shuffle {
         let Some(parent) = path.parent() else { return };
         let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let dest = unique_child(parent, &format!("{stem} (no background).png"));
+        let gen = self.begin_busy(format!("正在移除 {stem} 的背景"));
         cx.spawn(async move |this, cx| {
             let ok = cx
                 .background_spawn(async move {
@@ -5355,9 +5789,14 @@ impl Shuffle {
                         .unwrap_or(false)
                 })
                 .await;
-            if ok {
-                let _ = this.update(cx, |this, cx| this.refresh_pane(pane, cx));
-            }
+            let _ = this.update(cx, |this, cx| {
+                if ok {
+                    this.end_busy(gen, pane, cx);
+                } else if this.busy_gen == gen {
+                    this.busy = None;
+                    cx.notify();
+                }
+            });
         })
         .detach();
     }
@@ -5559,8 +5998,16 @@ impl Shuffle {
                 .into_any_element(),
             );
             let p = path.clone();
+            let compress_label = {
+                let selection = &self.tab(pane).selection;
+                if selection.len() > 1 && selection.contains(&p) {
+                    format!("压缩 {} 个项目", selection.len())
+                } else {
+                    "压缩".to_string()
+                }
+            };
             items.push(
-                ctx_item("压缩", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                ctx_item_owned(("compress", 0usize), compress_label, cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.close_context_menu(cx);
                     this.compress_entry(pane, p.clone(), cx);
                 }))
@@ -6811,6 +7258,26 @@ impl Shuffle {
                     .into_any_element(),
                 );
             }
+            SidebarTarget::StagingItem(p) => {
+                items.push(
+                    ctx_item("移出中转站", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_sidebar_menu(cx);
+                        this.remove_staging_item(&p);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+                );
+            }
+            SidebarTarget::StagingHeader => {
+                items.push(
+                    ctx_item("清空中转站", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_sidebar_menu(cx);
+                        this.clear_staging();
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+                );
+            }
             SidebarTarget::Sftp(server) => {
                 let s = server.clone();
                 items.push(
@@ -7533,6 +8000,14 @@ impl Shuffle {
                 }
             }
             KeyAction::QuickLook => self.toggle_quick_look(pane, cx),
+            KeyAction::Back => self.go_back(pane, cx),
+            KeyAction::Forward => self.go_forward(pane, cx),
+            KeyAction::Up => {
+                if let Some(parent) = self.tab(pane).current_dir.parent() {
+                    let parent = parent.to_path_buf();
+                    self.navigate_in(pane, parent, cx);
+                }
+            }
             KeyAction::Open => {
                 if let Some(p) = anchor {
                     let is_dir = p.is_dir();
@@ -11088,6 +11563,166 @@ impl Shuffle {
         !self.collapsed_sections.contains(title)
     }
 
+    /// 中转站 section header (expanded sidebar): shows the staged count, is a
+    /// drop target (drag files in → copy to staging), and is draggable to move
+    /// the whole tray out. Right-click clears the tray.
+    fn staging_header_el(&self, cx: &Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let count = self.staging.len();
+        let label = format!("中转站（{count}）");
+        let all = self.staging.clone();
+        div()
+            .id(SharedString::from("sec-中转站"))
+            .flex()
+            .items_center()
+            .justify_between()
+            .px_3()
+            .pt_4()
+            .pb_1()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(rgb(t.text_dim))
+                    .hover(|s| s.text_color(rgb(t.text)))
+                    .child(div().w(px(10.0)).child("▾"))
+                    .child(label),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    let (x, y) = (
+                        f64::from(ev.position.x) as f32,
+                        f64::from(ev.position.y) as f32,
+                    );
+                    if !all.is_empty() {
+                        this.staging_drag = Some((all.clone(), (x, y)));
+                    }
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    let (x, y) = (
+                        f64::from(ev.position.x) as f32,
+                        f64::from(ev.position.y) as f32,
+                    );
+                    this.open_sidebar_menu(x, y, SidebarTarget::StagingHeader, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .drag_over::<ExternalPaths>(|s, _, _, _| s.bg(rgb(theme().selected)))
+            .on_drop(cx.listener(move |this, d: &ExternalPaths, _, cx| {
+                this.close_sidebar_menu(cx);
+                this.stage_files(d.paths().to_vec(), cx);
+            }))
+            .tooltip(tip(
+                "拖文件到这里暂存；按住头部可把全部暂存文件拖出到目标文件夹",
+            ))
+    }
+
+    /// One staged item row: draggable to move it out of the staging folder;
+    /// right-click offers "移出中转站".
+    fn staging_item_el(&self, key: usize, path: PathBuf, cx: &Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let label = path_label(&path);
+        let icon = icon_element(&path, cached_is_dir(&path));
+        let drag_path = path.clone();
+        let right_path = path.clone();
+        div()
+            .id(("nav", usize::MAX - key))
+            .flex()
+            .items_center()
+            .rounded_md()
+            .mx_2()
+            .px_2()
+            .py_1()
+            .gap_2()
+            .cursor_pointer()
+            .text_color(rgb(t.text_muted))
+            .hover(|s| s.bg(rgb(t.hover)).text_color(rgb(t.text)))
+            .child(icon)
+            .child(div().min_w_0().flex_1().truncate().child(label))
+            .tooltip(tip("拖到目标文件夹移出暂存；右键可移出中转站"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    let (x, y) = (
+                        f64::from(ev.position.x) as f32,
+                        f64::from(ev.position.y) as f32,
+                    );
+                    this.staging_drag = Some((vec![drag_path.clone()], (x, y)));
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    let (x, y) = (
+                        f64::from(ev.position.x) as f32,
+                        f64::from(ev.position.y) as f32,
+                    );
+                    this.open_sidebar_menu(x, y, SidebarTarget::StagingItem(right_path.clone()), cx);
+                    cx.stop_propagation();
+                }),
+            )
+    }
+
+    /// 中转站 tray icon for the collapsed (icon-rail) sidebar: drop draggable
+    /// files on it to stage them; drag it out to move the whole tray.
+    fn staging_rail_el(&self, cx: &Context<Self>) -> impl IntoElement {
+        let count = self.staging.len();
+        let all = self.staging.clone();
+        div()
+            .id("staging-rail")
+            .mx_1()
+            .py_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .cursor_pointer()
+            .text_color(rgb(theme().text_muted))
+            .hover(|s| s.bg(rgb(theme().hover)))
+            .child("🧺")
+            .tooltip(tip(format!(
+                "中转站（{count} 项）：拖文件到此暂存，拖动此图标移出全部"
+            )))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    let (x, y) = (
+                        f64::from(ev.position.x) as f32,
+                        f64::from(ev.position.y) as f32,
+                    );
+                    if !all.is_empty() {
+                        this.staging_drag = Some((all.clone(), (x, y)));
+                    }
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    let (x, y) = (
+                        f64::from(ev.position.x) as f32,
+                        f64::from(ev.position.y) as f32,
+                    );
+                    this.open_sidebar_menu(x, y, SidebarTarget::StagingHeader, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .drag_over::<ExternalPaths>(|s, _, _, _| s.bg(rgb(theme().selected)))
+            .on_drop(cx.listener(move |this, d: &ExternalPaths, _, cx| {
+                this.close_sidebar_menu(cx);
+                this.stage_files(d.paths().to_vec(), cx);
+            }))
+    }
+
     fn render_sidebar(&self, cx: &Context<Self>) -> impl IntoElement {
         let current = self.active_tab().current_dir.clone();
         let current = current.as_path();
@@ -11256,6 +11891,22 @@ impl Shuffle {
                             push_group_member(&mut items, cx, &mut key, gidx, p.clone(), current, false);
                         }
                     }
+                }
+            }
+        }
+
+        // --- 中转站 (staging tray): drop files in, drag items (or the whole
+        // tray) out to a folder / Finder to move them out. ---
+        if collapsed {
+            push_divider(&mut items);
+            items.push(self.staging_rail_el(cx).into_any_element());
+        } else {
+            items.push(self.staging_header_el(cx).into_any_element());
+            if self.staging.is_empty() {
+                items.push(empty_hint("拖文件到这里暂存").into_any_element());
+            } else {
+                for (i, p) in self.staging.iter().enumerate() {
+                    items.push(self.staging_item_el(i, p.clone(), cx).into_any_element());
                 }
             }
         }
@@ -11824,7 +12475,8 @@ impl Shuffle {
                     .gap_1()
                     .px_2()
                     .h(px(TAB_H - 6.0))
-                    .max_w(px(180.0))
+                    .min_w(px(TAB_MIN_W))
+                    .max_w(px(TAB_MAX_W))
                     .rounded_md()
                     .cursor_pointer()
                     .text_color(if active { rgb(t.text) } else { rgb(t.text_muted) })
@@ -12634,6 +13286,22 @@ impl Render for Shuffle {
             // Focusable so it receives key events (Cmd+P, palette typing).
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
+            // Mouse side buttons (back / forward, button 3 & 4) walk the active
+            // pane's history, like Finder's back/forward arrows.
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    let pane = this.active_pane;
+                    this.go_back(pane, cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    let pane = this.active_pane;
+                    this.go_forward(pane, cx);
+                }),
+            )
             // Track column drags anywhere in the window so the cursor can leave
             // the thin handle without dropping the resize.
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
@@ -12642,6 +13310,7 @@ impl Render for Shuffle {
                 // A press-then-move on a file row becomes a native OS drag (so
                 // files can be dropped into Finder or any other app).
                 this.maybe_start_os_drag(x, y, window, cx);
+                this.maybe_start_staging_drag(x, y, window, cx);
                 this.update_resize(x, cx);
                 this.update_scroll_drag(y, cx);
                 this.update_divider(x, cx);
@@ -12652,6 +13321,7 @@ impl Render for Shuffle {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     this.drag_candidate = None;
+                    this.staging_drag = None;
                     this.end_resize();
                     this.end_scroll_drag(cx);
                     this.divider_drag = None;
@@ -12707,6 +13377,28 @@ impl Render for Shuffle {
                                 cx.notify();
                             })),
                     ),
+            );
+        }
+
+        // Busy banner (in-flight compress / extract / paste / transfer…).
+        if let Some(p) = self.busy.clone() {
+            root = root.child(
+                div()
+                    .flex_none()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_4()
+                    .py_1p5()
+                    .bg(rgb(t.accent))
+                    .text_color(rgb(0xffffff))
+                    .text_xs()
+                    .child(div().child("⇣").text_sm())
+                    .child(div().flex_1().child(match p.percent {
+                        Some(n) => format!("{}… {n}%", p.label),
+                        None => format!("{}…", p.label),
+                    })),
             );
         }
 
@@ -13336,7 +14028,7 @@ fn is_pdf(path: &Path) -> bool {
 /// Archive suffixes "Extract Here" can unpack with built-in tools, longest
 /// first so `foo.tar.gz` strips as a tarball rather than a ".gz".
 const ARCHIVE_SUFFIXES: &[&str] = &[
-    ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tbz", ".txz", ".tar", ".zip",
+    ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tbz", ".txz", ".tar", ".zip", ".7z",
 ];
 
 /// The matched archive suffix of `path`, if it's an extractable archive.
@@ -13346,9 +14038,16 @@ fn archive_suffix(path: &Path) -> Option<&'static str> {
 }
 
 /// The extraction command for `path`, ready for the destination directory to
-/// be appended as its final argument (`ditto -xk src DEST` / `tar -xf src -C DEST`).
-fn archive_extract_command(path: &Path) -> Option<Command> {
+/// be appended as its final argument (`ditto -xk src DEST` / `tar -xf src -C DEST`);
+/// `.7z` embeds the destination in a `-o` flag (7zz syntax) and needs no append.
+fn archive_extract_command(path: &Path, dest: &Path) -> Option<Command> {
     let suffix = archive_suffix(path)?;
+    if suffix == ".7z" {
+        let zz = seven_zip_path()?;
+        let mut c = Command::new(zz);
+        c.arg("x").arg(path).arg(format!("-o{}", dest.display()));
+        return Some(c);
+    }
     let mut c;
     if suffix == ".zip" {
         c = Command::new("ditto");
@@ -13569,6 +14268,81 @@ fn apps_for_file(path: &Path) -> Vec<(String, PathBuf)> {
     }
     out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
     out
+}
+
+/// Extract the last percentage from a 7zz progress line: it prints things
+/// like "  47%  big.bin", so scan the whole line for the final "N%".
+fn parse_percent(line: &str) -> Option<u32> {
+    let b = line.as_bytes();
+    let mut last = None;
+    let mut i = 0;
+    while i < b.len() {
+        if !b[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i < b.len() && b[i] == b'%' {
+            let mut num = 0u32;
+            for &d in &b[start..i] {
+                num = num * 10 + (d - b'0') as u32;
+            }
+            last = Some(num);
+            i += 1;
+        }
+    }
+    last
+}
+
+/// Which paths a Compress action should archive: the whole selection when the
+/// clicked item is part of a multi-item selection, otherwise just the clicked
+/// item (right-clicking an unselected item targets only it, like Finder).
+fn compress_targets(
+    selection: &HashSet<PathBuf>,
+    visible: &[PathBuf],
+    clicked: &Path,
+) -> Vec<PathBuf> {
+    if selection.len() > 1 && selection.contains(clicked) {
+        visible.iter().filter(|p| selection.contains(*p)).cloned().collect()
+    } else {
+        vec![clicked.to_path_buf()]
+    }
+}
+
+/// Archive base name: one item keeps its own name; several become "Archive".
+fn archive_base(paths: &[PathBuf]) -> String {
+    match paths {
+        [one] => one
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        _ => "Archive".to_string(),
+    }
+}
+
+/// The 7-Zip binary: the `7zz` bundled next to the executable (like removebg),
+/// else `7zz`/`7z`/`7za` found on PATH.
+fn seven_zip_path() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let cand = dir.join("7zz");
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    for dir in std::env::split_paths(&std::env::var_os("PATH")?) {
+        for name in ["7zz", "7z", "7za"] {
+            let cand = dir.join(name);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
 }
 
 /// A non-existing child path under `dir` based on `base` (adds " 2", " 3" …).
@@ -16490,7 +17264,16 @@ fn sort_entries(entries: &mut [Entry], key: SortKey, asc: bool) {
                 (kind_label(&e.name, e.is_dir).to_lowercase(), e.name.to_lowercase())
             });
         }
-        SortKey::Modified => entries.sort_by_key(|e| e.modified),
+        SortKey::Modified => {
+            // Folders stay pinned on top; each group ordered by modification date.
+            entries.sort_by(|a, b| {
+                b.is_dir.cmp(&a.is_dir).then_with(|| {
+                    let o = a.modified.cmp(&b.modified);
+                    if asc { o } else { o.reverse() }
+                })
+            });
+            return;
+        }
         SortKey::Created => entries.sort_by_key(|e| e.created),
         SortKey::Size => entries.sort_by_key(|e| e.size),
     }
@@ -16598,6 +17381,37 @@ mod hidden_file_tests {
         assert_eq!(read_entries_fast(&dir, true).len(), 2);
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn modified_desc_keeps_folders_on_top_newest_first() {
+        use super::{sort_entries, Entry, SortKey};
+        use std::time::{Duration, UNIX_EPOCH};
+        let mk = |name: &str, is_dir: bool, secs: u64| Entry {
+            name: name.to_string(),
+            is_dir,
+            size: 0,
+            modified: Some(UNIX_EPOCH + Duration::from_secs(secs)),
+            created: None,
+            loaded: true,
+        };
+        let mut e = vec![
+            mk("old-file", false, 1),
+            mk("new-file", false, 3),
+            mk("old-dir", true, 2),
+            mk("new-dir", true, 4),
+        ];
+        sort_entries(&mut e, SortKey::Modified, false);
+        let order: Vec<(&str, bool)> = e.iter().map(|x| (x.name.as_str(), x.is_dir)).collect();
+        assert_eq!(
+            order,
+            vec![
+                ("new-dir", true),
+                ("old-dir", true),
+                ("new-file", false),
+                ("old-file", false),
+            ]
+        );
     }
 }
 
@@ -17730,6 +18544,25 @@ fn home_dir() -> PathBuf {
 fn config_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(|h| PathBuf::from(h).join("Library/Application Support/Shuffle"))
+}
+
+/// The folder where 中转站 (staging) files live. Real copies on disk, so the
+/// tray survives restarts and is unaffected if the originals move or vanish.
+fn staging_dir() -> PathBuf {
+    config_dir()
+        .unwrap_or_else(home_dir)
+        .join("staging")
+}
+
+/// List the currently staged paths (the staging folder's contents), sorted.
+fn staged_paths() -> Vec<PathBuf> {
+    let d = staging_dir();
+    let mut out: Vec<PathBuf> = match fs::read_dir(&d) {
+        Ok(rd) => rd.filter_map(|e| e.ok().map(|e| e.path())).collect(),
+        Err(_) => return Vec::new(),
+    };
+    out.sort();
+    out
 }
 
 fn config_file(name: &str) -> Option<PathBuf> {
