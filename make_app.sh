@@ -7,6 +7,17 @@ cd "$(dirname "$0")"
 APP="Shuffle.app"
 # Version from Cargo.toml so the bundle matches the crate.
 VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+# When Swift helper compilation is unavailable, keep the last known-good helper
+# binaries rather than silently dropping Remove Background and cloud actions.
+# A caller can point at a verified older bundle to bootstrap a fresh checkout.
+HELPER_SOURCE="${SHUFFLE_HELPER_SOURCE:-$APP}"
+HELPER_CACHE="$(mktemp -d "${TMPDIR:-/tmp}/shuffle-helpers.XXXXXX")"
+trap 'rm -rf "$HELPER_CACHE"' EXIT
+for helper in removebg cloudctl; do
+    if [ -f "$HELPER_SOURCE/Contents/MacOS/$helper" ]; then
+        cp "$HELPER_SOURCE/Contents/MacOS/$helper" "$HELPER_CACHE/$helper"
+    fi
+done
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
@@ -79,6 +90,16 @@ if command -v swiftc >/dev/null 2>&1; then
         echo "WARNING: cloudctl helper failed to compile (cloud download/evict disabled)"
     fi
 fi
+
+# Reuse a previously verified helper only if the current source could not be
+# compiled. Each helper is signed again below together with the new bundle.
+for helper in removebg cloudctl; do
+    if [ ! -f "$APP/Contents/MacOS/$helper" ] && [ -f "$HELPER_CACHE/$helper" ]; then
+        cp "$HELPER_CACHE/$helper" "$APP/Contents/MacOS/$helper"
+        chmod +x "$APP/Contents/MacOS/$helper"
+        echo "Reused $helper helper from $HELPER_SOURCE"
+    fi
+done
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
