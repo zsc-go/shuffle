@@ -734,6 +734,7 @@ enum KeyAction {
     Find,
     SelectAll,
     Copy,
+    Cut,
     Paste,
     NewFile,
     NewFolder,
@@ -770,6 +771,7 @@ impl KeyAction {
         KeyAction::Find,
         KeyAction::SelectAll,
         KeyAction::Copy,
+        KeyAction::Cut,
         KeyAction::Paste,
         KeyAction::NewFile,
         KeyAction::NewFolder,
@@ -820,6 +822,7 @@ impl KeyAction {
             KeyAction::Find => "find",
             KeyAction::SelectAll => "select_all",
             KeyAction::Copy => "copy",
+            KeyAction::Cut => "cut",
             KeyAction::Paste => "paste",
             KeyAction::NewFile => "new_file",
             KeyAction::NewFolder => "new_folder",
@@ -853,6 +856,7 @@ impl KeyAction {
             KeyAction::Find => "筛选当前文件夹",
             KeyAction::SelectAll => "全选",
             KeyAction::Copy => "复制文件",
+            KeyAction::Cut => "剪切文件",
             KeyAction::Paste => "粘贴文件",
             KeyAction::NewFile => "新建文件",
             KeyAction::NewFolder => "新建文件夹",
@@ -886,6 +890,7 @@ impl KeyAction {
             KeyAction::Find => Some("/"),
             KeyAction::SelectAll => Some("cmd-a"),
             KeyAction::Copy => Some("cmd-c"),
+            KeyAction::Cut => Some("cmd-x"),
             KeyAction::Paste => Some("cmd-v"),
             KeyAction::QuickLook => Some("space"),
             KeyAction::Back => Some("cmd-["),
@@ -1107,9 +1112,10 @@ mod shortcut_tests {
     }
 
     #[test]
-    fn file_copy_and_paste_use_standard_macos_shortcuts() {
+    fn file_clipboard_actions_use_standard_macos_shortcuts() {
         let keymap = Keymap::defaults();
         assert!(matches!(keymap.action_for("cmd-c"), Some(KeyAction::Copy)));
+        assert!(matches!(keymap.action_for("cmd-x"), Some(KeyAction::Cut)));
         assert!(matches!(keymap.action_for("cmd-v"), Some(KeyAction::Paste)));
     }
 
@@ -3140,6 +3146,31 @@ struct ContextMenu {
     view: MenuView,
 }
 
+// Context menus are at least this wide. Keep the submenu on the side with
+// enough room for both panels; the root panel itself is independently snapped
+// into the viewport by `anchored()`.
+const CONTEXT_MENU_MIN_WIDTH: f32 = 200.0;
+const CONTEXT_SUBMENU_GAP: f32 = 4.0;
+
+fn context_submenu_opens_left(menu_x: f32, viewport_width: f32) -> bool {
+    menu_x + CONTEXT_MENU_MIN_WIDTH * 2.0 + CONTEXT_SUBMENU_GAP > viewport_width
+}
+
+#[cfg(test)]
+mod context_menu_placement_tests {
+    use super::*;
+
+    #[test]
+    fn submenu_stays_on_the_right_when_both_panels_fit() {
+        assert!(!context_submenu_opens_left(500.0, 1_000.0));
+    }
+
+    #[test]
+    fn submenu_flips_left_near_the_right_edge() {
+        assert!(context_submenu_opens_left(700.0, 1_000.0));
+    }
+}
+
 /// In-progress inline rename of a file/folder.
 struct Rename {
     pane: usize,
@@ -3150,6 +3181,47 @@ struct Rename {
     /// Selection anchor (char index); `Some` and different from `cursor` means
     /// that range is selected (starts as the whole name, like Finder).
     anchor: Option<usize>,
+}
+
+/// Initial inline-rename selection. Regular files keep their final extension
+/// out of the default selection, while folders (whose dots are part of the
+/// name) and extensionless files stay fully selected. Indices are characters,
+/// matching the cursor representation used by [`Rename`].
+fn rename_initial_selection(name: &str, is_dir: bool) -> (usize, Option<usize>) {
+    let end = name.chars().count();
+    let selected_end = if is_dir {
+        end
+    } else {
+        Path::new(name)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(|stem| stem.chars().count())
+            .unwrap_or(end)
+    };
+    (selected_end, (selected_end > 0).then_some(0))
+}
+
+#[cfg(test)]
+mod rename_initial_selection_tests {
+    use super::*;
+
+    #[test]
+    fn regular_file_selects_only_its_stem() {
+        assert_eq!(rename_initial_selection("report.pdf", false), (6, Some(0)));
+        assert_eq!(rename_initial_selection("archive.tar.gz", false), (11, Some(0)));
+        assert_eq!(rename_initial_selection("测试文档.docx", false), (4, Some(0)));
+    }
+
+    #[test]
+    fn hidden_and_extensionless_files_stay_fully_selected() {
+        assert_eq!(rename_initial_selection(".gitignore", false), (10, Some(0)));
+        assert_eq!(rename_initial_selection("README", false), (6, Some(0)));
+    }
+
+    #[test]
+    fn folders_keep_the_full_name_selected() {
+        assert_eq!(rename_initial_selection("My.app", true), (6, Some(0)));
+    }
 }
 
 /// The editable surface currently owning macOS text input. The existing UI
@@ -3267,6 +3339,146 @@ struct Entry {
     loaded: bool,
 }
 
+/// Counts direct children in the current listing. This intentionally uses the
+/// already-loaded rows instead of recursively walking subfolders, so changing
+/// directories updates the window status immediately without I/O stalls.
+fn folder_entry_counts(entries: &[Entry]) -> (usize, usize) {
+    let folders = entries.iter().filter(|entry| entry.is_dir).count();
+    (folders, entries.len().saturating_sub(folders))
+}
+
+fn folder_summary_label(entries: &[Entry], visible_matches: Option<usize>) -> String {
+    let (folders, files) = folder_entry_counts(entries);
+    match visible_matches {
+        Some(matches) => format!("{folders} 个文件夹 · {files} 个文件 · 显示 {matches} 项"),
+        None => format!("{folders} 个文件夹 · {files} 个文件"),
+    }
+}
+
+/// Keep Quick Look navigation useful without passing an unbounded large
+/// directory through a command-line invocation.
+const QUICK_LOOK_MAX_ITEMS: usize = 512;
+
+/// Build the ordered paths given to macOS Quick Look. A single selected item
+/// can move through the current pane's visible listing; a multi-selection
+/// stays scoped to exactly those selected paths. The focused item is always
+/// first, which is the item `qlmanage -p` initially opens.
+fn quick_look_playlist(
+    visible: &[PathBuf],
+    selection: &HashSet<PathBuf>,
+    anchor: Option<&Path>,
+    max_items: usize,
+) -> Vec<PathBuf> {
+    let selected: Vec<&PathBuf> = visible
+        .iter()
+        .filter(|path| selection.contains(*path))
+        .collect();
+    let primary = anchor
+        .filter(|path| visible.iter().any(|item| item.as_path() == *path))
+        .or_else(|| selected.first().map(|path| path.as_path()));
+    let Some(primary) = primary else {
+        return Vec::new();
+    };
+    let limit = max_items.max(1);
+
+    if selected.len() > 1 {
+        let mut paths = Vec::with_capacity(selected.len().min(limit));
+        paths.push(primary.to_path_buf());
+        paths.extend(
+            selected
+                .into_iter()
+                .filter(|path| path.as_path() != primary)
+                .take(limit.saturating_sub(1))
+                .cloned(),
+        );
+        return paths;
+    }
+
+    let start = visible
+        .iter()
+        .position(|path| path.as_path() == primary)
+        .expect("primary was checked against the visible listing");
+    (0..visible.len().min(limit))
+        .map(|offset| visible[(start + offset) % visible.len()].clone())
+        .collect()
+}
+
+#[cfg(test)]
+mod quick_look_playlist_tests {
+    use super::*;
+
+    fn paths() -> Vec<PathBuf> {
+        ["a.jpg", "b.jpg", "c.jpg", "d.jpg"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect()
+    }
+
+    #[test]
+    fn single_selection_opens_current_item_then_visible_neighbours() {
+        let visible = paths();
+        let selection = [PathBuf::from("b.jpg")].into_iter().collect();
+        assert_eq!(
+            quick_look_playlist(&visible, &selection, Some(Path::new("b.jpg")), 512),
+            ["b.jpg", "c.jpg", "d.jpg", "a.jpg"].into_iter().map(PathBuf::from).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn multi_selection_stays_within_selected_items() {
+        let visible = paths();
+        let selection = [PathBuf::from("b.jpg"), PathBuf::from("d.jpg")]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            quick_look_playlist(&visible, &selection, Some(Path::new("d.jpg")), 512),
+            ["d.jpg", "b.jpg"].into_iter().map(PathBuf::from).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn playlist_is_capped_for_very_large_folders() {
+        let visible = paths();
+        let selection = [PathBuf::from("b.jpg")].into_iter().collect();
+        assert_eq!(
+            quick_look_playlist(&visible, &selection, Some(Path::new("b.jpg")), 2),
+            ["b.jpg", "c.jpg"].into_iter().map(PathBuf::from).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[cfg(test)]
+mod folder_summary_tests {
+    use super::*;
+
+    fn entry(name: &str, is_dir: bool) -> Entry {
+        Entry {
+            name: name.into(),
+            is_dir,
+            size: 0,
+            modified: None,
+            created: None,
+            loaded: true,
+        }
+    }
+
+    #[test]
+    fn counts_files_and_folders_separately() {
+        let entries = vec![entry("Documents", true), entry("Photos", true), entry("notes.txt", false)];
+        assert_eq!(folder_entry_counts(&entries), (2, 1));
+        assert_eq!(folder_summary_label(&entries, None), "2 个文件夹 · 1 个文件");
+    }
+
+    #[test]
+    fn includes_visible_filter_count_without_changing_folder_total() {
+        let entries = vec![entry("Documents", true), entry("notes.txt", false)];
+        assert_eq!(
+            folder_summary_label(&entries, Some(1)),
+            "1 个文件夹 · 1 个文件 · 显示 1 项"
+        );
+    }
+}
+
 /// A file's cloud-storage materialization state. Detected from the kernel's
 /// `SF_DATALESS` flag, which Finder itself uses — set on iCloud and File
 /// Provider (Dropbox, Google Drive, OneDrive, …) placeholders whose bytes live
@@ -3323,7 +3535,9 @@ enum ViewMode {
 /// find, and path-edit state.
 struct Tab {
     current_dir: PathBuf,
-    entries: Vec<Entry>,
+    /// Shared with a background find scan. Copying every filename from this
+    /// list on the UI thread made IME commits stall in very large folders.
+    entries: Arc<Vec<Entry>>,
     /// Hidden-file preference used to build `entries`; inactive tabs compare
     /// this when selected so even an empty hidden-only folder reloads.
     loaded_show_hidden: bool,
@@ -3400,7 +3614,7 @@ struct Tab {
 impl Tab {
     fn new(dir: PathBuf) -> Self {
         // Fast first paint; full metadata is filled in from the background.
-        let entries = read_entries_fast(&dir, prefs().show_hidden);
+        let entries = Arc::new(read_entries_fast(&dir, prefs().show_hidden));
         Tab {
             current_dir: dir.clone(),
             entries,
@@ -3576,6 +3790,10 @@ struct Shuffle {
     /// In-memory fuzzy index of ~/ (None until the background build finishes).
     index: Option<Arc<FileIndex>>,
     context_menu: Option<ContextMenu>,
+    /// Files marked for a Shuffle-local Cut. Their URLs also live on the
+    /// native pasteboard, but only this in-memory marker turns Paste into a
+    /// move; a later external copy continues to paste as a safe copy.
+    cut_paths: Option<Vec<PathBuf>>,
     /// Finder-style Quick Look process launched by the Space shortcut.
     quick_look: Option<std::process::Child>,
     /// In-progress inline rename, if any.
@@ -3873,6 +4091,7 @@ impl Shuffle {
             palette_scroll: ScrollHandle::new(),
             index: None,
             context_menu: None,
+            cut_paths: None,
             quick_look: None,
             rename: None,
             sort_menu: None,
@@ -4162,32 +4381,33 @@ impl Shuffle {
         }
     }
 
-    /// Toggle a native macOS Quick Look panel for the active selection. Multiple
-    /// selected files are passed together so the panel can move between them.
+    /// Toggle a native macOS Quick Look panel for the active selection. A
+    /// single selected item gets the pane's visible neighbours for native
+    /// left/right navigation; a multi-selection stays scoped to those items.
     fn toggle_quick_look(&mut self, pane: usize, cx: &mut Context<Self>) {
         if self.close_quick_look() {
             cx.notify();
             return;
         }
-        let tab = self.tab(pane);
-        if tab.remote.is_some() {
+        if self.tab(pane).remote.is_some() {
             return;
         }
-        let mut paths: Vec<PathBuf> = tab
-            .selection
-            .iter()
+        let selection = self.tab(pane).selection.clone();
+        let anchor = self.tab(pane).anchor.clone();
+        let visible: Vec<PathBuf> = self
+            .display_paths(pane)
+            .into_iter()
             .filter(|path| path.exists())
-            .cloned()
             .collect();
-        if paths.is_empty() {
-            if let Some(path) = tab.anchor.clone().filter(|path| path.exists()) {
-                paths.push(path);
-            }
-        }
+        let paths = quick_look_playlist(
+            &visible,
+            &selection,
+            anchor.as_deref(),
+            QUICK_LOOK_MAX_ITEMS,
+        );
         if paths.is_empty() {
             return;
         }
-        paths.sort();
         self.quick_look = Command::new("/usr/bin/qlmanage")
             .arg("-p")
             .args(paths)
@@ -4203,6 +4423,18 @@ impl Shuffle {
     fn open_context_menu(&mut self, pane: usize, x: f32, y: f32, target: Option<(PathBuf, bool)>, cx: &mut Context<Self>) {
         self.active_pane = pane.min(self.panes.len() - 1);
         self.rename = None;
+        // Finder convention: a contextual action applies to the clicked item.
+        // Preserve a multi-selection only when the clicked item is already in
+        // it; otherwise make that item the sole selection before opening menu.
+        if let Some((path, _)) = target.as_ref() {
+            let tab = self.tab_mut(self.active_pane);
+            if !tab.selection.contains(path) {
+                tab.selection.clear();
+                tab.selection.insert(path.clone());
+                tab.selection_anchor = Some(path.clone());
+                tab.anchor = Some(path.clone());
+            }
+        }
         self.context_menu = Some(ContextMenu {
             x,
             y,
@@ -4241,6 +4473,20 @@ impl Shuffle {
         self.reload_pane(pane, cx);
     }
 
+    /// Swap a listing without cloning its rows for the main-thread filter.
+    /// Any background scan still holding the old `Arc` is invalidated before
+    /// it can publish index results against this replacement list.
+    fn replace_entries(&mut self, pane: usize, entries: Vec<Entry>) {
+        let tab = self.tab_mut(pane);
+        tab.entries = Arc::new(entries);
+        tab.find_epoch += 1;
+        tab.find_results.clear();
+    }
+
+    fn clear_entries(&mut self, pane: usize) {
+        self.replace_entries(pane, Vec::new());
+    }
+
     /// Load (or reload) a pane's directory: a near-instant cheap pass for first
     /// paint, then a background pass that fills in sizes/dates without blocking.
     fn reload_pane(&mut self, pane: usize, cx: &mut Context<Self>) {
@@ -4256,7 +4502,7 @@ impl Shuffle {
         self.tab_mut(pane).dir_mtime = fs::metadata(&dir).ok().and_then(|m| m.modified().ok());
         let show_hidden = prefs().show_hidden;
         self.tab_mut(pane).loaded_show_hidden = show_hidden;
-        self.tab_mut(pane).entries = read_entries_fast(&dir, show_hidden);
+        self.replace_entries(pane, read_entries_fast(&dir, show_hidden));
         self.next_load_gen += 1;
         let gen = self.next_load_gen;
         self.tab_mut(pane).load_gen = gen;
@@ -4278,7 +4524,7 @@ impl Shuffle {
                     && this.tab(pane).load_gen == gen
                     && this.tab(pane).current_dir == dir
                 {
-                    this.tab_mut(pane).entries = full;
+                    this.replace_entries(pane, full);
                     this.sort_tab(pane);
                     if this.tab(pane).find_query.is_some() {
                         this.recompute_find(pane, cx);
@@ -4303,7 +4549,7 @@ impl Shuffle {
         let gen = self.next_load_gen;
         self.tab_mut(pane).load_gen = gen;
         // Show a placeholder (empty) immediately; the listing arrives async.
-        self.tab_mut(pane).entries.clear();
+        self.clear_entries(pane);
         cx.notify();
         let use_system = prefs().ssh_use_system;
         let show_hidden = prefs().show_hidden;
@@ -4323,7 +4569,7 @@ impl Shuffle {
                 }
                 match result {
                     Ok(entries) => {
-                        this.tab_mut(pane).entries = entries;
+                        this.replace_entries(pane, entries);
                         this.remote_error = None;
                         this.sort_tab(pane);
                         if this.tab(pane).find_query.is_some() {
@@ -4332,7 +4578,7 @@ impl Shuffle {
                         this.prewarm_icons(cx);
                     }
                     Err(e) => {
-                        this.tab_mut(pane).entries.clear();
+                        this.clear_entries(pane);
                         this.remote_error = Some(e);
                     }
                 }
@@ -4457,7 +4703,13 @@ impl Shuffle {
     /// Re-apply this tab's sort criterion to its entries.
     fn sort_tab(&mut self, pane: usize) {
         let (key, asc) = (self.tab(pane).sort_key, self.tab(pane).sort_asc);
-        sort_entries(&mut self.tab_mut(pane).entries, key, asc);
+        let tab = self.tab_mut(pane);
+        let entries: &mut Vec<Entry> = Arc::make_mut(&mut tab.entries);
+        sort_entries(entries, key, asc);
+        // A result index from a scan started before a re-sort no longer points
+        // to the same entry. Drop it before the next scan starts.
+        tab.find_epoch += 1;
+        tab.find_results.clear();
     }
 
     /// Set the sort criterion (clicking the same column toggles direction).
@@ -4562,31 +4814,6 @@ impl Shuffle {
     ) {
         self.reveal_in_pane(pane, path.clone(), cx);
         self.begin_rename(pane, path, window, cx);
-    }
-
-    /// Quick Look the current selection (spacebar), like Finder. Uses macOS
-    /// `qlmanage -p`, which pops the system preview panel. Local files only —
-    /// remote (SFTP) items aren't on disk for QuickLook to read.
-    fn quick_look(&self, pane: usize) {
-        if self.tab(pane).remote.is_some() {
-            return;
-        }
-        let mut paths: Vec<PathBuf> = self.tab(pane).selection.iter().cloned().collect();
-        if paths.is_empty() {
-            if let Some(a) = self.tab(pane).anchor.clone() {
-                paths.push(a);
-            }
-        }
-        if paths.is_empty() {
-            return;
-        }
-        paths.sort();
-        let _ = Command::new("qlmanage")
-            .arg("-p")
-            .args(&paths)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
     }
 
     fn open_path(&mut self, pane: usize, path: PathBuf, is_dir: bool, cx: &mut Context<Self>) {
@@ -4996,18 +5223,27 @@ impl Shuffle {
     /// Begin renaming `path`: the row's name becomes an editable field.
     fn begin_rename(&mut self, pane: usize, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.active_pane = pane;
+        let is_dir = {
+            let tab = self.tab(pane);
+            tab.entries
+                .iter()
+                .find(|entry| tab.current_dir.join(&entry.name) == path)
+                .map(|entry| entry.is_dir)
+                .unwrap_or_else(|| path.is_dir())
+        };
         let text = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        // Start with the whole name selected, like Finder.
-        let end = text.chars().count();
+        // Like Finder, select the base name of a file so typing preserves its
+        // extension. Folders retain the historical full-name selection.
+        let (cursor, anchor) = rename_initial_selection(&text, is_dir);
         self.rename = Some(Rename {
             pane,
             path,
             text,
-            cursor: end,
-            anchor: if end > 0 { Some(0) } else { None },
+            cursor,
+            anchor,
         });
         window.focus(&self.focus);
         cx.notify();
@@ -5329,6 +5565,36 @@ impl Shuffle {
             cx.notify();
             return;
         }
+        let paths = self.selected_local_paths(pane);
+        if !paths.is_empty() && write_file_clipboard(&paths) {
+            // Copy after Cut changes the pending operation back to a copy.
+            self.cut_paths = None;
+            self.remote_error = None;
+            cx.notify();
+        }
+    }
+
+    /// Mark the local selection for a move on the next Shuffle Paste. The
+    /// paths are also put on the native pasteboard so a user can still copy
+    /// them into Finder or another application.
+    fn cut_selected_files(&mut self, pane: usize, cx: &mut Context<Self>) {
+        if self.tab(pane).remote.is_some() {
+            self.remote_error = Some("远程文件请先下载后再剪切".into());
+            cx.notify();
+            return;
+        }
+        let paths = self.selected_local_paths(pane);
+        if !paths.is_empty() && write_file_clipboard(&paths) {
+            self.cut_paths = Some(paths);
+            self.remote_error = None;
+            cx.notify();
+        }
+    }
+
+    /// The selected, existing local paths in display order. Falling back to
+    /// the anchor lets keyboard and context-menu actions work after a normal
+    /// single selection as well as after Cmd/Shift multi-selection.
+    fn selected_local_paths(&self, pane: usize) -> Vec<PathBuf> {
         let selection = self.tab(pane).selection.clone();
         let mut paths: Vec<PathBuf> = self
             .display_paths(pane)
@@ -5340,25 +5606,52 @@ impl Shuffle {
                 paths.push(path);
             }
         }
-        if !paths.is_empty() && write_file_clipboard(&paths) {
-            self.remote_error = None;
-            cx.notify();
-        }
+        paths
     }
 
     /// Paste native file URLs from the macOS clipboard into the active folder.
-    /// Local copies run off the UI thread and use `ditto` to preserve metadata.
+    /// Local copies run off the UI thread and use `ditto` to preserve metadata;
+    /// a matching Shuffle Cut instead uses the existing collision-safe mover.
     fn paste_files(&mut self, pane: usize, cx: &mut Context<Self>) {
         let sources = read_file_clipboard();
         if sources.is_empty() {
             return;
         }
         let dest_dir = self.tab(pane).current_dir.clone();
+        let is_cut = self.cut_paths.as_deref() == Some(sources.as_slice());
         if self.tab(pane).remote.is_some() {
+            if is_cut {
+                self.remote_error = Some("不能将剪切的文件直接粘贴到远程服务器；请先复制或下载后上传".into());
+                cx.notify();
+                return;
+            }
             let locals: Vec<PathBuf> = sources.into_iter().filter(|path| path.exists()).collect();
             if !locals.is_empty() {
                 self.upload_to_remote(pane, dest_dir, locals, cx);
             }
+            return;
+        }
+
+        if is_cut {
+            let total = sources.len() as u32;
+            let gen = self.begin_busy(format!("正在移动 {total} 个项目"));
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_spawn(async move { move_paths_into(&dest_dir, &sources) })
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.busy_gen != gen {
+                        return;
+                    }
+                    this.busy = None;
+                    if result.is_ok() {
+                        this.cut_paths = None;
+                    }
+                    this.remote_error = result.err();
+                    this.refresh_all_panes(cx);
+                });
+            })
+            .detach();
             return;
         }
 
@@ -6029,6 +6322,7 @@ impl Shuffle {
         &self,
         pane: usize,
         target: Option<(PathBuf, bool)>,
+        submenu_on_left: bool,
         cx: &Context<Self>,
     ) -> Vec<AnyElement> {
         // Remote (SFTP) tabs get a reduced menu — the local-only actions
@@ -6037,6 +6331,7 @@ impl Shuffle {
         if self.tab(pane).remote.is_some() {
             return self.menu_remote(pane, target, cx);
         }
+        let has_target = target.is_some();
         let terminal_target = target.clone();
         let mut items: Vec<AnyElement> = Vec::new();
         if let Some((path, is_dir)) = target {
@@ -6052,7 +6347,13 @@ impl Shuffle {
                 .menu_view_is(MenuView::OpenWith)
                 .then(|| ctx_menu_panel(self.menu_open_with(pane, path.clone(), cx)));
             items.push(
-                ctx_parent("打开方式", MenuView::OpenWith, open_with_submenu, cx)
+                ctx_parent(
+                    "打开方式",
+                    MenuView::OpenWith,
+                    open_with_submenu,
+                    submenu_on_left,
+                    cx,
+                )
                 .into_any_element(),
             );
             if !is_dir {
@@ -6156,6 +6457,28 @@ impl Shuffle {
                 }
             }
             items.push(ctx_separator().into_any_element());
+            items.push(
+                ctx_item("复制", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.copy_selected_files(pane, cx);
+                    this.close_context_menu(cx);
+                }))
+                .into_any_element(),
+            );
+            items.push(
+                ctx_item("剪切", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.cut_selected_files(pane, cx);
+                    this.close_context_menu(cx);
+                }))
+                .into_any_element(),
+            );
+            items.push(
+                ctx_item("粘贴", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.paste_files(pane, cx);
+                    this.close_context_menu(cx);
+                }))
+                .into_any_element(),
+            );
+            items.push(ctx_separator().into_any_element());
             let p = path.clone();
             items.push(
                 ctx_item("重命名", cx.listener(move |this, _: &ClickEvent, window, cx| {
@@ -6202,7 +6525,13 @@ impl Shuffle {
                     .menu_view_is(MenuView::AddToGroup)
                     .then(|| ctx_menu_panel(self.menu_add_to_group(path.clone(), cx)));
                 items.push(
-                    ctx_parent("添加到分组", MenuView::AddToGroup, group_submenu, cx)
+                    ctx_parent(
+                        "添加到分组",
+                        MenuView::AddToGroup,
+                        group_submenu,
+                        submenu_on_left,
+                        cx,
+                    )
                     .into_any_element(),
                 );
             }
@@ -6253,7 +6582,13 @@ impl Shuffle {
                 .menu_view_is(MenuView::Tags)
                 .then(|| ctx_menu_panel(self.menu_tags(pane, path.clone(), cx)));
             items.push(
-                ctx_parent("标签", MenuView::Tags, tags_submenu, cx)
+                ctx_parent(
+                    "标签",
+                    MenuView::Tags,
+                    tags_submenu,
+                    submenu_on_left,
+                    cx,
+                )
                 .into_any_element(),
             );
             let quick_actions_submenu = self
@@ -6264,6 +6599,7 @@ impl Shuffle {
                     "快速操作",
                     MenuView::QuickActions,
                     quick_actions_submenu,
+                    submenu_on_left,
                     cx,
                 )
                 .into_any_element(),
@@ -6272,7 +6608,25 @@ impl Shuffle {
                 .menu_view_is(MenuView::Services)
                 .then(|| ctx_menu_panel(self.menu_services(pane, path.clone(), is_dir, cx)));
             items.push(
-                ctx_parent("服务", MenuView::Services, services_submenu, cx)
+                ctx_parent(
+                    "服务",
+                    MenuView::Services,
+                    services_submenu,
+                    submenu_on_left,
+                    cx,
+                )
+                .into_any_element(),
+            );
+            items.push(ctx_separator().into_any_element());
+        }
+        // On blank space only Paste applies; Copy/Cut are attached to the
+        // selected entry above so a right-click never acts on an older item.
+        if !has_target {
+            items.push(
+                ctx_item("粘贴", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.paste_files(pane, cx);
+                    this.close_context_menu(cx);
+                }))
                 .into_any_element(),
             );
             items.push(ctx_separator().into_any_element());
@@ -6286,6 +6640,7 @@ impl Shuffle {
                     "在终端中打开",
                     MenuView::Terminal,
                     terminal_submenu,
+                    submenu_on_left,
                     cx,
                 )
                 .into_any_element(),
@@ -6589,10 +6944,12 @@ impl Shuffle {
         items
     }
 
-    fn render_context_menu(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_context_menu(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let menu = self.context_menu.as_ref().expect("called only when open");
         let pane = menu.pane;
-        let root_items = self.menu_root(pane, menu.target.clone(), cx);
+        let viewport_width = f64::from(window.viewport_size().width) as f32;
+        let submenu_on_left = context_submenu_opens_left(menu.x, viewport_width);
+        let root_items = self.menu_root(pane, menu.target.clone(), submenu_on_left, cx);
 
         // Full-window backdrop: any click/right-click outside closes the menu.
         div()
@@ -8190,6 +8547,7 @@ impl Shuffle {
                 cx.notify();
             }
             KeyAction::Copy => self.copy_selected_files(pane, cx),
+            KeyAction::Cut => self.cut_selected_files(pane, cx),
             KeyAction::Paste => self.paste_files(pane, cx),
             KeyAction::NewFile => self.new_file(pane, window, cx),
             KeyAction::NewFolder => self.new_folder(pane, window, cx),
@@ -8350,7 +8708,7 @@ impl Shuffle {
                 }
                 // Spacebar → Quick Look the selection, like Finder.
                 if key == "space" {
-                    self.quick_look(pane);
+                    self.toggle_quick_look(pane, cx);
                     return;
                 }
             }
@@ -9516,14 +9874,10 @@ impl Shuffle {
         let dir = tab.current_dir.clone();
         let plain = fq.text.clone();
 
-        // Sort order: when a column sort is active OR there's no free text to
-        // rank by, keep the list's existing order; otherwise rank by match.
-        let keep_order = tab.sort_key != SortKey::None || !has_text;
-
-        // No free text to rank by (operator filters only, or a column sort
-        // active): the pass is cheap and runs inline, so toggling ext:/size:
-        // filters still resolves this frame.
-        if !has_text || keep_order {
+        // Operator-only filters are cheap and resolve in this frame. A free
+        // text term always takes the background path: with a column sort we
+        // keep the current display order, but it still must match file names.
+        if !has_text {
             let mut out = Vec::new();
             for (i, e) in tab.entries.iter().enumerate() {
                 if !fq.matches_entry(&e.name, e.is_dir, e.size, e.modified) {
@@ -9540,19 +9894,12 @@ impl Shuffle {
             return;
         }
 
-        // Free-text ranking is O(entries) with per-name allocations and a sort;
-        // run it on a background thread so typing in the filter never blocks a
-        // frame. Snapshot only the fields the scorer needs (cheap one-time
-        // clone), clear the results now so a stale index list can't be read
-        // against re-sorted/reloaded entries, and bump the epoch so an older
-        // in-flight scan is discarded. A new keystroke lands results in place
-        // when its scan finishes.
-        let names: Vec<(usize, String, bool, u64, Option<SystemTime>)> = tab
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(i, e)| (i, e.name.clone(), e.is_dir, e.size, e.modified))
-            .collect();
+        // Free-text filtering is O(entries) and can do fuzzy scoring + a sort.
+        // Share the immutable listing with the worker instead of cloning every
+        // file name on the UI thread; the latter blocked IME commit callbacks
+        // for seconds in large directories.
+        let entries = Arc::clone(&tab.entries);
+        let rank_by_score = tab.sort_key == SortKey::None;
         let content = content_ready.cloned();
         tab.find_results.clear();
         tab.find_epoch += 1;
@@ -9561,7 +9908,14 @@ impl Shuffle {
         cx.spawn(async move |this, cx| {
             let scored = cx
                 .background_spawn(async move {
-                    find_scan(&dir, &names, &fq, &plain, content.as_ref())
+                    find_scan(
+                        &dir,
+                        entries.as_ref(),
+                        &fq,
+                        &plain,
+                        content.as_ref(),
+                        rank_by_score,
+                    )
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -9832,7 +10186,7 @@ impl Shuffle {
         tab.current_dir = PathBuf::from("/");
         tab.history = vec![PathBuf::from("/")];
         tab.hist_pos = 0;
-        tab.entries.clear();
+        tab.entries = Arc::default();
         let p = self.pane_mut(pane);
         p.tabs.push(tab);
         p.active = p.tabs.len() - 1;
@@ -10141,10 +10495,10 @@ impl Shuffle {
             self.toggle_entry(pane, path, cx);
         } else if mods.shift {
             self.range_select(pane, path, cx);
-        } else if is_dir {
-            self.navigate_in(pane, path, cx);
         } else if ev.click_count() >= 2 {
-            self.open_path(pane, path, false, cx);
+            // File and folder rows follow the same Finder-style activation:
+            // one click selects, double-click opens (or enters a folder).
+            self.open_path(pane, path, is_dir, cx);
         } else {
             self.select_entry(pane, path, cx);
         }
@@ -11316,7 +11670,7 @@ impl Shuffle {
             // Warm icons for the active tab of every visible pane.
             for pane in &self.panes {
                 let tab = pane.active_tab();
-                for entry in &tab.entries {
+                for entry in tab.entries.iter() {
                     if entry.is_dir {
                         has_dir = true;
                         continue;
@@ -12804,8 +13158,37 @@ impl Shuffle {
             )
     }
 
-    /// Render one pane: tab strip → path bar → column header → virtualized
-    /// listing + scrollbar, plus the right-edge split drop zone.
+    /// Bottom status line for a pane's current directory. A non-empty filter
+    /// adds the count currently shown, while the file/folder totals remain for
+    /// the directory as a whole.
+    fn render_folder_summary(&self, pane: usize) -> impl IntoElement {
+        let tab = self.tab(pane);
+        let visible_matches = tab
+            .find_query
+            .as_deref()
+            .filter(|query| !query.trim().is_empty())
+            .map(|_| tab.find_results.len());
+        let label = folder_summary_label(tab.entries.as_ref(), visible_matches);
+        let t = theme();
+
+        div()
+            .id(("folder-summary", pane))
+            .flex_none()
+            .w_full()
+            .h(px(25.0))
+            .px_3()
+            .flex()
+            .items_center()
+            .text_xs()
+            .text_color(rgb(t.text_muted))
+            .bg(rgb(t.surface))
+            .border_t_1()
+            .border_color(rgb(t.border))
+            .child(label)
+    }
+
+    /// Render one pane: tab strip → path bar → virtualized listing → current
+    /// folder status, plus the right-edge split drop zone.
     fn render_pane(&self, pane: usize, cx: &Context<Self>) -> impl IntoElement {
         let view = self.tab(pane).view;
         // Highlight the active pane's border (only meaningful when split).
@@ -12850,6 +13233,7 @@ impl Shuffle {
                     .children(self.rename_error_pill(pane))
                     .child(self.render_filter_box(pane, cx)),
             )
+            .child(self.render_folder_summary(pane))
     }
 
     /// The List view body: clickable column header + virtualized rows.
@@ -13507,7 +13891,7 @@ fn header_cell(
 }
 
 impl Render for Shuffle {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme();
         // Kick off any pending waterfall folder reads before rendering the tree.
         self.ensure_waterfall_loaded(cx);
@@ -13660,7 +14044,7 @@ impl Render for Shuffle {
             root = root.child(self.render_palette(cx));
         }
         if self.context_menu.is_some() {
-            root = root.child(self.render_context_menu(cx));
+            root = root.child(self.render_context_menu(window, cx));
         }
         if let Some((p, x, y)) = self.sort_menu {
             root = root.child(self.render_sort_menu(p, x, y, cx));
@@ -14145,7 +14529,7 @@ fn ctx_separator() -> impl IntoElement {
 /// to each other so the pointer can travel directly into the secondary menu.
 fn ctx_menu_panel(items: Vec<AnyElement>) -> AnyElement {
     div()
-        .min_w(px(200.0))
+        .min_w(px(CONTEXT_MENU_MIN_WIDTH))
         .py_1()
         .bg(menu_style().bg_rgba())
         .text_color(rgb(menu_style().text))
@@ -14165,6 +14549,7 @@ fn ctx_parent(
     label: &'static str,
     view: MenuView,
     submenu: Option<AnyElement>,
+    submenu_on_left: bool,
     cx: &Context<Shuffle>,
 ) -> impl IntoElement {
     let t = theme();
@@ -14194,12 +14579,20 @@ fn ctx_parent(
             this.set_menu_view(view, cx);
         }))
         .children(submenu.map(|submenu| {
-            div()
-                .absolute()
-                .left(relative(1.0))
-                .top_0()
-                .ml(px(4.0))
-                .child(submenu)
+            let positioned = if submenu_on_left {
+                div()
+                    .absolute()
+                    .right(relative(1.0))
+                    .top_0()
+                    .mr(px(CONTEXT_SUBMENU_GAP))
+            } else {
+                div()
+                    .absolute()
+                    .left(relative(1.0))
+                    .top_0()
+                    .ml(px(CONTEXT_SUBMENU_GAP))
+            };
+            positioned.child(submenu)
         }))
 }
 
@@ -18139,45 +18532,48 @@ fn find_score(q: &str, name: &str) -> Option<i32> {
     None
 }
 
-/// The find bar's ranking pass over one snapshot row set: filter by
-/// `fq`/`content`, then rank by fuzzy score (ties → dirs first, then
-/// case-insensitive name). Pure, so it runs off the UI thread and is
-/// unit-testable; empty `plain` keeps entry order.
+/// The find bar's pass over a shared, immutable listing: filter by
+/// `fq`/`content`, then optionally rank fuzzy matches. Pure, so it runs off
+/// the UI thread and is unit-testable.
 fn find_scan(
     dir: &Path,
-    rows: &[(usize, String, bool, u64, Option<SystemTime>)],
+    entries: &[Entry],
     fq: &FilterQuery,
     plain: &str,
     content: Option<&HashSet<PathBuf>>,
+    rank_by_score: bool,
 ) -> Vec<usize> {
     let mut scored: Vec<(i32, usize)> = Vec::new();
-    for (i, name, is_dir, size, modified) in rows {
-        if !fq.matches_entry(name, *is_dir, *size, *modified) {
+    for (i, entry) in entries.iter().enumerate() {
+        if !fq.matches_entry(&entry.name, entry.is_dir, entry.size, entry.modified) {
             continue;
         }
         if let Some(hits) = content {
-            if !hits.contains(&dir.join(name)) {
+            if !hits.contains(&dir.join(&entry.name)) {
                 continue;
             }
         }
         if plain.is_empty() {
-            scored.push((0, *i));
+            scored.push((0, i));
             continue;
         }
-        let Some(score) = find_score(plain, name) else {
+        let Some(score) = find_score(plain, &entry.name) else {
             continue;
         };
-        scored.push((score, *i));
+        scored.push((score, i));
     }
-    if plain.is_empty() {
+    if plain.is_empty() || !rank_by_score {
         return scored.into_iter().map(|(_, i)| i).collect();
     }
     // Best score first; ties → dirs first, then alphabetical.
     scored.sort_by(|a, b| {
         b.0.cmp(&a.0)
-            .then_with(|| rows[b.1].2.cmp(&rows[a.1].2))
+            .then_with(|| entries[b.1].is_dir.cmp(&entries[a.1].is_dir))
             .then_with(|| {
-                rows[a.1].1.to_lowercase().cmp(&rows[b.1].1.to_lowercase())
+                entries[a.1]
+                    .name
+                    .to_lowercase()
+                    .cmp(&entries[b.1].name.to_lowercase())
             })
     });
     scored.into_iter().map(|(_, i)| i).collect()
@@ -18507,19 +18903,30 @@ mod palette_search_tests {
 mod find_scan_tests {
     use super::*;
 
+    fn entry(name: &str, is_dir: bool) -> Entry {
+        Entry {
+            name: name.into(),
+            is_dir,
+            size: 0,
+            modified: None,
+            created: None,
+            loaded: true,
+        }
+    }
+
     /// Rows in directory order: an exact name, a dir tie-break candidate, a
     /// non-match, and a fuzzy match — the scan must rank by score, prefer
     /// dirs on ties, and drop non-matches, mirroring the pre-async behavior.
     #[test]
     fn ranks_by_score_then_dir_then_name() {
-        let rows = vec![
-            (0usize, "report".into(), false, 0u64, None),
-            (1usize, "report-dir".into(), true, 0u64, None),
-            (2usize, "notes.md".into(), false, 0u64, None),
-            (3usize, "zzz-report".into(), false, 0u64, None),
+        let entries = vec![
+            entry("report", false),
+            entry("report-dir", true),
+            entry("notes.md", false),
+            entry("zzz-report", false),
         ];
         let fq = FilterQuery::parse("report");
-        let hits = find_scan(Path::new("/tmp"), &rows, &fq, "report", None);
+        let hits = find_scan(Path::new("/tmp"), &entries, &fq, "report", None, true);
         // Exact match first; among equal prefix scores the dir wins the
         // tie-break; the unrelated file is absent.
         assert_eq!(hits, vec![0, 1, 3]);
@@ -18527,13 +18934,27 @@ mod find_scan_tests {
 
     #[test]
     fn empty_plain_keeps_entry_order() {
-        let rows = vec![
-            (0usize, "b.txt".into(), false, 0u64, None),
-            (1usize, "a.txt".into(), false, 0u64, None),
+        let entries = vec![
+            entry("b.txt", false),
+            entry("a.txt", false),
         ];
         let fq = FilterQuery::parse("ext:txt");
-        let hits = find_scan(Path::new("/tmp"), &rows, &fq, "", None);
+        let hits = find_scan(Path::new("/tmp"), &entries, &fq, "", None, false);
         assert_eq!(hits, vec![0, 1]);
+    }
+
+    #[test]
+    fn column_sort_keeps_order_but_still_filters_free_text() {
+        let entries = vec![
+            entry("zebra.txt", false),
+            entry("report-late.txt", false),
+            entry("notes.md", false),
+            entry("report-early.txt", false),
+        ];
+        let fq = FilterQuery::parse("report");
+        let hits = find_scan(Path::new("/tmp"), &entries, &fq, "report", None, false);
+
+        assert_eq!(hits, vec![1, 3]);
     }
 }
 
