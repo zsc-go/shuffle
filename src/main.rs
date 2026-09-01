@@ -3282,10 +3282,55 @@ const TAB_MIN_W: f32 = 96.0;
 const TAB_MAX_W: f32 = 180.0;
 /// Fixed list-row height (so marquee selection can map y-coordinates to rows).
 const ROW_H: f32 = 24.0;
+/// GPUI normally reports an incrementing click count, but nested marquee/drag
+/// handlers can occasionally collapse a physical double-click into two single
+/// click events. Keep a short, Finder-like fallback window for the same item.
+const ENTRY_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 /// Overlay scrollbar: stays solid this long after the last scroll…
 const SCROLLBAR_LINGER: f32 = 1.0;
 /// …then fades out over this long (seconds).
 const SCROLLBAR_FADE: f32 = 0.35;
+
+fn same_recent_entry_click(
+    last: Option<&(usize, PathBuf, Instant)>,
+    pane: usize,
+    path: &Path,
+    now: Instant,
+) -> bool {
+    last.is_some_and(|(last_pane, last_path, last_at)| {
+        *last_pane == pane
+            && last_path == path
+            && now.duration_since(*last_at) <= ENTRY_DOUBLE_CLICK_WINDOW
+    })
+}
+
+#[cfg(test)]
+mod entry_click_tests {
+    use super::*;
+
+    #[test]
+    fn same_item_clicked_within_the_window_activates() {
+        let now = Instant::now();
+        let folder = PathBuf::from("folder");
+        let recent = (0, folder.clone(), now - Duration::from_millis(400));
+        assert!(same_recent_entry_click(Some(&recent), 0, &folder, now));
+        assert!(!same_recent_entry_click(Some(&recent), 1, &folder, now));
+        assert!(!same_recent_entry_click(
+            Some(&recent),
+            0,
+            Path::new("other-folder"),
+            now
+        ));
+    }
+
+    #[test]
+    fn expired_click_does_not_activate() {
+        let now = Instant::now();
+        let folder = PathBuf::from("folder");
+        let expired = (0, folder.clone(), now - Duration::from_millis(501));
+        assert!(!same_recent_entry_click(Some(&expired), 0, &folder, now));
+    }
+}
 /// Duration of the pane split open/close animation.
 const SPLIT_ANIM_MS: u64 = 220;
 /// Red used for an invalid rename (field border/text + the reason pill).
@@ -4130,6 +4175,9 @@ struct Shuffle {
     next_load_gen: u64,
     /// In-progress marquee (box) selection: (pane, start, current) window coords.
     marquee: Option<(usize, (f32, f32), (f32, f32))>,
+    /// The most recent unmodified item click, used as a fallback when the UI
+    /// framework does not preserve a native double-click count.
+    last_entry_click: Option<(usize, PathBuf, Instant)>,
     /// A left-press on a draggable row: (pane, path, press position). Promoted to
     /// a native OS drag once the cursor moves past a small threshold.
     drag_candidate: Option<(usize, PathBuf, (f32, f32))>,
@@ -4470,6 +4518,7 @@ impl Shuffle {
             confirm_delete: None,
             next_load_gen: 0,
             marquee: None,
+            last_entry_click: None,
             drag_candidate: None,
             server_dialog: None,
             ssh_ask: false,
@@ -11033,15 +11082,32 @@ impl Shuffle {
         self.term_focused = false;
         let mods = ev.modifiers();
         if mods.platform {
+            self.last_entry_click = None;
             self.toggle_entry(pane, path, cx);
         } else if mods.shift {
+            self.last_entry_click = None;
             self.range_select(pane, path, cx);
-        } else if ev.click_count() >= 2 {
+        } else if self.entry_activated(pane, &path, ev.click_count() >= 2) {
             // File and folder rows follow the same Finder-style activation:
             // one click selects, double-click opens (or enters a folder).
             self.open_path(pane, path, is_dir, cx);
         } else {
             self.select_entry(pane, path, cx);
+        }
+    }
+
+    /// Record an ordinary item click and report whether it activates the item.
+    /// Native double-click counts remain authoritative; the timestamp fallback
+    /// covers event paths where they are lost before reaching `on_click`.
+    fn entry_activated(&mut self, pane: usize, path: &Path, native_double: bool) -> bool {
+        let now = Instant::now();
+        let repeated = same_recent_entry_click(self.last_entry_click.as_ref(), pane, path, now);
+        if native_double || repeated {
+            self.last_entry_click = None;
+            true
+        } else {
+            self.last_entry_click = Some((pane, path.to_path_buf(), now));
+            false
         }
     }
 
@@ -11446,15 +11512,18 @@ impl Shuffle {
             .map(|entry| dir.join(entry.name))
             .collect::<Vec<_>>();
         if mods.platform {
+            self.last_entry_click = None;
             self.toggle_entry(pane, target, cx);
             return;
         }
         if mods.shift {
+            self.last_entry_click = None;
             self.range_select_ordered(pane, target, &order, cx);
             return;
         }
+        let activated = self.entry_activated(pane, &target, ev.click_count() >= 2);
         if is_dir {
-            if ev.click_count() >= 2 {
+            if activated {
                 // Double-click drills in as the new root.
                 self.navigate_in(pane, target, cx);
                 return;
@@ -11476,7 +11545,7 @@ impl Shuffle {
                 tab.selection.insert(target.clone());
                 tab.selection_anchor = Some(target.clone());
             }
-            if ev.click_count() >= 2 {
+            if activated {
                 self.open_path(pane, target, false, cx);
             } else {
                 cx.notify();
