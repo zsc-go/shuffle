@@ -46,8 +46,29 @@ use rayon::prelude::*;
 
 const RECENTS_CAP: usize = 12;
 
-// Menu-bar actions.
+// Menu-bar actions. OpenSettings/Quit are app-level; the rest are dispatched to
+// the focused explorer window and handled in `Shuffle::render`'s root.
 actions!(shuffle, [OpenSettings, Quit]);
+actions!(
+    shuffle,
+    [
+        NewTab,
+        NewFolder,
+        CloseTab,
+        MoveToTrash,
+        ViewList,
+        ViewIcons,
+        ViewColumns,
+        ViewGallery,
+        ToggleSidebar,
+        GoBack,
+        GoForward,
+        GoHome,
+        GoApplications,
+        GoComputer,
+        FocusSearch,
+    ]
+);
 
 // ----- theming ---------------------------------------------------------------
 
@@ -361,7 +382,7 @@ struct Prefs {
     ssh_configured: bool,
     /// Show the expandable "waterfall" folder tree at the bottom of the sidebar.
     waterfall: bool,
-    /// Command palette / search window opacity, as a percent (40–100). Lower is
+    /// Command palette / search window opacity, as a percent (20–100). Lower is
     /// more see-through; the default is nearly opaque so it doesn't read as a
     /// confusing floating pane over the explorer.
     palette_opacity: u8,
@@ -426,7 +447,7 @@ fn prefs() -> Prefs {
 
 /// The command palette's background alpha (0–255) from the opacity pref.
 fn palette_alpha() -> u32 {
-    let pct = prefs().palette_opacity.clamp(40, 100) as u32;
+    let pct = prefs().palette_opacity.clamp(20, 100) as u32;
     pct * 255 / 100
 }
 
@@ -1224,6 +1245,9 @@ struct Settings {
     recording: Option<KeyAction>,
     /// In-progress hex color entry: (which color, typed hex digits).
     color_edit: Option<(ColorTarget, String)>,
+    /// In-progress typed entry for the search-window opacity (the digits shown
+    /// while the value field is focused). `None` when not editing.
+    opacity_edit: Option<String>,
 }
 
 /// Section names shown as nested rail items for a settings tab (and the order
@@ -1257,6 +1281,7 @@ impl Settings {
             focus: cx.focus_handle(),
             recording: None,
             color_edit: None,
+            opacity_edit: None,
         }
     }
 
@@ -1280,12 +1305,67 @@ impl Settings {
         .detach();
     }
 
-    /// Route key events: hex entry first, then keybind recording.
+    /// Route key events: opacity/hex entry first, then keybind recording.
     fn handle_settings_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
-        if self.color_edit.is_some() {
+        if self.opacity_edit.is_some() {
+            self.handle_opacity_key(ev, cx);
+        } else if self.color_edit.is_some() {
             self.handle_hex_key(ev, cx);
         } else if self.recording.is_some() {
             self.handle_keybind_key(ev, cx);
+        }
+    }
+
+    /// Capture typed digits for the search-window opacity field; each edit
+    /// applies live (clamped 40–100), Enter/Esc finish. Typing "30" sets 30%.
+    fn handle_opacity_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        let apply = |s: &str, cx: &mut Context<Self>| {
+            if let Ok(n) = s.parse::<u8>() {
+                let mut np = prefs();
+                np.palette_opacity = n.clamp(20, 100);
+                apply_prefs(np, cx);
+            }
+        };
+        match ev.keystroke.key.as_str() {
+            "escape" | "enter" | "tab" => {
+                // Commit whatever's typed (clamped), then leave edit mode.
+                if let Some(s) = self.opacity_edit.take() {
+                    if !s.is_empty() {
+                        apply(&s, cx);
+                    }
+                }
+                cx.notify();
+            }
+            "backspace" => {
+                if let Some(s) = self.opacity_edit.as_mut() {
+                    s.pop();
+                }
+                if let Some(s) = self.opacity_edit.clone() {
+                    if !s.is_empty() {
+                        apply(&s, cx);
+                    }
+                }
+                cx.notify();
+            }
+            _ => {
+                if let Some(ch) = ev.keystroke.key_char.as_ref() {
+                    if let Some(s) = self.opacity_edit.as_mut() {
+                        for c in ch.chars() {
+                            // Up to 3 digits ("100"); ignore anything else.
+                            if c.is_ascii_digit() && s.len() < 3 {
+                                s.push(c);
+                            }
+                        }
+                    }
+                    // Apply live as they type so the preview updates.
+                    if let Some(s) = self.opacity_edit.clone() {
+                        if !s.is_empty() {
+                            apply(&s, cx);
+                        }
+                    }
+                    cx.notify();
+                }
+            }
         }
     }
 
@@ -1497,25 +1577,145 @@ impl Render for Settings {
             }))
             .child(rail)
             .child(
-                // The section blocks are direct children so a rail link can
-                // scroll_to_top_of_item(section_index + 1) to jump to one.
+                // Relative wrapper so the scrollbar thumb can overlay the
+                // scrolling content at the right edge.
                 div()
-                    .id("settings-content")
+                    .relative()
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.content_scroll)
-                    .flex()
-                    .flex_col()
-                    .gap_4()
-                    .p_5()
-                    .children(children),
+                    .child(
+                        // The section blocks are direct children so a rail link
+                        // can scroll_to_top_of_item(section_index + 1) to jump.
+                        div()
+                            .id("settings-content")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.content_scroll)
+                            .flex()
+                            .flex_col()
+                            .gap_4()
+                            .p_5()
+                            .children(children),
+                    )
+                    .children(static_scrollbar_thumb(&self.content_scroll)),
             )
     }
 }
 
 impl Settings {
+    /// The search-window-opacity row: title/description on the left, and on the
+    /// right a −/+ stepper around a **typable** value. Click the number to edit
+    /// it and just type (e.g. "30" → 30%); Enter/Esc/click-away commit.
+    fn render_opacity_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = theme();
+        let pct = prefs().palette_opacity;
+        let editing = self.opacity_edit.clone();
+
+        let step_btn = |bid: &'static str, glyph: &'static str, delta: i16| {
+            div()
+                .id(bid)
+                .flex_none()
+                .w(px(24.0))
+                .h(px(24.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .cursor_pointer()
+                .bg(rgb(t.surface))
+                .text_color(rgb(t.text))
+                .hover(|s| s.bg(rgb(t.hover)))
+                .child(glyph)
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    // Stepping also leaves the typing field, committing nothing extra.
+                    this.opacity_edit = None;
+                    let mut np = prefs();
+                    let next = (np.palette_opacity as i16 + delta).clamp(20, 100);
+                    np.palette_opacity = next as u8;
+                    apply_prefs(np, cx);
+                    cx.notify();
+                }))
+        };
+
+        // The value: an editable field when focused, else a clickable label.
+        let value: AnyElement = match &editing {
+            Some(s) => div()
+                .id("opacity-value")
+                .flex_none()
+                .min_w(px(52.0))
+                .px_2()
+                .h(px(24.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .bg(rgb(t.bg))
+                .border_1()
+                .border_color(rgb(t.accent))
+                .text_color(rgb(t.text))
+                .child(s.clone())
+                // A caret so it reads as an active text field.
+                .child(div().w(px(1.5)).h(px(13.0)).ml(px(1.0)).bg(rgb(t.text)))
+                .child("%")
+                .into_any_element(),
+            None => div()
+                .id("opacity-value")
+                .flex_none()
+                .min_w(px(52.0))
+                .px_2()
+                .h(px(24.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .cursor_text()
+                .text_color(rgb(t.text))
+                .hover(|s| s.bg(rgb(t.hover)))
+                .child(format!("{pct}%"))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    // Start empty so the user can just type the number they want.
+                    this.opacity_edit = Some(String::new());
+                    window.focus(&this.focus);
+                    cx.notify();
+                }))
+                .into_any_element(),
+        };
+
+        div()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_4()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_color(rgb(t.text)).child("Search window opacity"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(t.text_muted))
+                            .child("How opaque the Cmd+P search window is. Click the number to type a value (20–100). Lower lets the explorer show through."),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(step_btn("opacity-dec", "\u{2212}", -1))
+                    .child(value)
+                    .child(step_btn("opacity-inc", "+", 1)),
+            )
+            .into_any_element()
+    }
+
     /// The General tab as an ordered list of blocks: page header, then one card
     /// per section (matching `tab_sections(0)`), then the reset button. Returned
     /// as separate children so the rail can scroll to any section.
@@ -1788,25 +1988,9 @@ impl Settings {
                         }),
                     )
                     .into_any_element(),
-                    stepper_row(
-                        "st-palette-opacity",
-                        "搜索窗口不透明度",
-                        "Cmd+P 搜索窗口的不透明度；较低时可看到资源管理器，默认值较高以保证可读性。",
-                        format!("{}%", p.palette_opacity),
-                        cx.listener(|_, _: &ClickEvent, _, cx| {
-                            let mut np = prefs();
-                            np.palette_opacity = np.palette_opacity.saturating_sub(5).max(40);
-                            apply_prefs(np, cx);
-                            cx.notify();
-                        }),
-                        cx.listener(|_, _: &ClickEvent, _, cx| {
-                            let mut np = prefs();
-                            np.palette_opacity = (np.palette_opacity + 5).min(100);
-                            apply_prefs(np, cx);
-                            cx.notify();
-                        }),
-                    )
-                    .into_any_element(),
+                    self.render_opacity_row(cx),
+                    // Live sample so the opacity change is visible immediately.
+                    palette_opacity_preview(),
                 ],
 
             ),
@@ -2003,7 +2187,15 @@ impl Settings {
                     .child(
                         div()
                             .text_color(rgb(t.text))
-                            .child(format!("版本 {}", env!("CARGO_PKG_VERSION"))),
+                            .child(format!(
+                                "版本 {} ({})",
+                                env!("CARGO_PKG_VERSION"),
+                                // Build stamp (git short SHA) baked in at compile
+                                // time so "which build am I actually running?"
+                                // is answerable from Settings. "dev" when built
+                                // without the stamp.
+                                option_env!("SHUFFLE_BUILD_SHA").unwrap_or("dev")
+                            )),
                     )
                     .child(div().text_xs().text_color(rgb(t.text_muted)).child(
                         "从 GitHub 检查新版本并就地安装；应用会替换自身并重新启动。",
@@ -2815,6 +3007,134 @@ fn reset_button(
         )
 }
 
+/// A live sample of the command palette for the opacity setting: a mock
+/// explorer backdrop with a scaled-down palette floating over it, using the
+/// same background alpha as the real palette. As the opacity stepper changes,
+/// this repaints so the user sees exactly how see-through the search window
+/// will be over their files.
+fn palette_opacity_preview() -> AnyElement {
+    let t = theme();
+    // Backdrop: a few faux "file rows" (icon chip + name/detail bars) so the
+    // transparency is visible — a solid backdrop would hide the effect.
+    let faux_row = |icon: u32, w1: f32, w2: f32| {
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .h(px(22.0))
+            .child(div().flex_none().w(px(12.0)).h(px(12.0)).rounded_sm().bg(rgb(icon)))
+            .child(div().flex_none().w(px(w1)).h(px(7.0)).rounded_full().bg(Theme::alpha(t.text, 0x44)))
+            .child(div().flex_none().w(px(w2)).h(px(7.0)).rounded_full().bg(Theme::alpha(t.text, 0x22)))
+    };
+    // In-flow, fills the fixed-height box (`size_full`). An outer box with only
+    // absolutely-positioned children collapses to zero — so the backdrop must be
+    // in-flow to reliably paint.
+    let backdrop = div()
+        .size_full()
+        .bg(rgb(t.bg))
+        .flex()
+        .flex_col()
+        .py_2()
+        .child(faux_row(t.accent, 90.0, 40.0))
+        .child(faux_row(t.accent, 120.0, 30.0))
+        .child(faux_row(0xd9844f, 70.0, 55.0))
+        .child(faux_row(t.accent, 140.0, 25.0))
+        .child(faux_row(0x4faf7a, 60.0, 45.0))
+        .child(faux_row(t.accent, 100.0, 35.0))
+        .child(faux_row(0xd9544f, 110.0, 30.0));
+
+    // A miniature palette, styled exactly like the real one (same alpha).
+    let hint = |k: &'static str| {
+        div()
+            .px_1()
+            .rounded_sm()
+            .bg(Theme::alpha(t.text_dim, 0x22))
+            .text_color(rgb(t.text_muted))
+            .child(k)
+    };
+    let sample = div()
+        .absolute()
+        .top(px(14.0))
+        .left(px(28.0))
+        .right(px(28.0))
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .bg(Theme::alpha(t.surface, palette_alpha()))
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(t.border_strong))
+        .shadow_lg()
+        // Input line.
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .border_b_1()
+                .border_color(rgb(t.border_strong))
+                .child(div().flex_none().text_color(rgb(t.accent)).child("›"))
+                .child(div().text_color(rgb(t.text)).child("Documents")),
+        )
+        // A selected result + a plain one.
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .h(px(24.0))
+                .bg(rgb(t.selected))
+                .child(div().flex_none().w(px(12.0)).h(px(12.0)).rounded_sm().bg(rgb(t.accent)))
+                .child(div().text_color(rgb(t.text)).child("Documents"))
+                .child(div().text_xs().text_color(rgb(t.text_muted)).child("~/Documents")),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .h(px(24.0))
+                .child(div().flex_none().w(px(12.0)).h(px(12.0)).rounded_sm().bg(rgb(t.accent)))
+                .child(div().text_color(rgb(t.text)).child("Downloads"))
+                .child(div().text_xs().text_color(rgb(t.text_muted)).child("~/Downloads")),
+        )
+        // Footer hints.
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .border_t_1()
+                .border_color(rgb(t.border_strong))
+                .text_xs()
+                .text_color(rgb(t.text_dim))
+                .child(hint("↩"))
+                .child("Open")
+                .child(hint("esc"))
+                .child("Close"),
+        );
+
+    div()
+        .relative()
+        .w_full()
+        .h(px(178.0))
+        .rounded_md()
+        .overflow_hidden()
+        .border_1()
+        .border_color(rgb(t.border))
+        // Fixed height + in-flow backdrop; the sample palette floats over it.
+        .child(backdrop)
+        .child(sample)
+        .into_any_element()
+}
+
 /// A labelled on/off toggle row used in the General settings tab. `id` must be
 /// unique per row, or only the first switch receives clicks.
 fn toggle_row(
@@ -3279,6 +3599,10 @@ enum SidebarTarget {
     StagingHeader,
     /// Right-clicked a 中转站 item (path) → offer "Remove from staging".
     StagingItem(PathBuf),
+    /// A tab chip: (pane, tab index) → New Tab / Duplicate / Close / Close Others.
+    Tab(usize, usize),
+    /// The nav/path bar of a pane → New Tab / Copy Path / Open in Terminal.
+    NavBar(usize),
 }
 
 /// One row in the command palette: a title, a gray subtitle (full path), and
@@ -4045,6 +4369,54 @@ impl Shuffle {
             }
         })
         .detach();
+        // Hidden debug harness (SHUFFLE_MQ_SIM=1): drive a marquee + edge drag
+        // programmatically and log what the auto-scroll loop does. Synthetic OS
+        // mouse events don't reach gpui, so this is how the mechanics are
+        // verified end-to-end in-process.
+        if std::env::var_os("SHUFFLE_MQ_SIM").is_some() {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_secs(3)).await;
+                let _ = this.update(cx, |this, cx| {
+                    let (top, bottom) = {
+                        let st = this.tab(0).scroll_handle.0.borrow();
+                        let b = st.base_handle.bounds();
+                        let top = f64::from(b.origin.y) as f32;
+                        (top, top + f64::from(b.size.height) as f32)
+                    };
+                    eprintln!("[mq-sim] viewport top={top:.0} bottom={bottom:.0}");
+                    let mid = (top + bottom) / 2.0;
+                    this.begin_marquee(0, 400.0, mid, cx);
+                    // Drag 60px past the bottom edge and hold.
+                    this.update_marquee(400.0, bottom + 60.0, cx);
+                    eprintln!("[mq-sim] begin at y={mid:.0}, cur held at y={:.0}", bottom + 60.0);
+                });
+                cx.background_executor().timer(Duration::from_secs(3)).await;
+                let _ = this.update(cx, |this, cx| {
+                    eprintln!(
+                        "[mq-sim] after 3s down: scrolled={:.0} selected={}",
+                        this.current_scrolled(0),
+                        this.tab(0).selection.len()
+                    );
+                    // Now hold 40px above the top edge — should scroll back up.
+                    let top = {
+                        let st = this.tab(0).scroll_handle.0.borrow();
+                        f64::from(st.base_handle.bounds().origin.y) as f32
+                    };
+                    this.update_marquee(400.0, top - 40.0, cx);
+                });
+                cx.background_executor().timer(Duration::from_secs(3)).await;
+                let _ = this.update(cx, |this, cx| {
+                    eprintln!(
+                        "[mq-sim] after 3s up: scrolled={:.0} selected={}",
+                        this.current_scrolled(0),
+                        this.tab(0).selection.len()
+                    );
+                    this.end_marquee(cx);
+                    eprintln!("[mq-sim] done");
+                });
+            })
+            .detach();
+        }
         // Rebuild icons when the icon pack changes.
         cx.observe_global::<IconPackGlobal>(|this, cx| {
             set_active_icon_pack(cx.global::<IconPackGlobal>().0.clone());
@@ -6189,6 +6561,36 @@ impl Shuffle {
         .detach();
     }
 
+    /// Compute a folder's total size in the background (once) and cache it, then
+    /// repaint so List view can show it. No-op if cached or already computing.
+    fn ensure_folder_size(&self, dir: PathBuf, cx: &mut Context<Self>) {
+        if folder_size_lookup(&dir).is_some() {
+            return;
+        }
+        let pending = FOLDER_SIZE_PENDING.get_or_init(|| Mutex::new(HashSet::new()));
+        if !pending.lock().unwrap().insert(dir.clone()) {
+            return; // already in flight
+        }
+        cx.spawn(async move |this, cx| {
+            let d = dir.clone();
+            let size = cx.background_spawn(async move { dir_total_size(&d) }).await;
+            let _ = this.update(cx, |_, cx| {
+                FOLDER_SIZE
+                    .get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock()
+                    .unwrap()
+                    .insert(dir.clone(), size);
+                FOLDER_SIZE_PENDING
+                    .get_or_init(|| Mutex::new(HashSet::new()))
+                    .lock()
+                    .unwrap()
+                    .remove(&dir);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// The badge state for an item: syncing if a download/evict is in flight,
     /// online-only if it's a cloud placeholder, else local (no badge). Only
     /// files under a cloud root are stat'd (cheap, cached) — everything else is
@@ -7892,6 +8294,72 @@ impl Shuffle {
                     .into_any_element(),
                 );
             }
+            SidebarTarget::Tab(pane, tab) => {
+                items.push(
+                    ctx_item("New Tab", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_sidebar_menu(cx);
+                        this.new_tab_in(pane, cx);
+                    }))
+                    .into_any_element(),
+                );
+                items.push(
+                    ctx_item("Duplicate Tab", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_sidebar_menu(cx);
+                        this.duplicate_tab(pane, tab, cx);
+                    }))
+                    .into_any_element(),
+                );
+                items.push(ctx_separator().into_any_element());
+                items.push(
+                    ctx_item("Close Tab", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_sidebar_menu(cx);
+                        this.close_tab(pane, tab, cx);
+                    }))
+                    .into_any_element(),
+                );
+                // Only offer "Close Other Tabs" when there's more than one.
+                if self.pane(pane).tabs.len() > 1 {
+                    items.push(
+                        ctx_item("Close Other Tabs", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.close_sidebar_menu(cx);
+                            this.close_other_tabs(pane, tab, cx);
+                        }))
+                        .into_any_element(),
+                    );
+                }
+            }
+            SidebarTarget::NavBar(pane) => {
+                items.push(
+                    ctx_item("New Tab", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_sidebar_menu(cx);
+                        this.new_tab_in(pane, cx);
+                    }))
+                    .into_any_element(),
+                );
+                let dir = self.tab(pane).current_dir.clone();
+                let is_remote = self.tab(pane).remote.is_some();
+                let dc = dir.clone();
+                items.push(
+                    ctx_item("Copy Path", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_sidebar_menu(cx);
+                        cx.write_to_clipboard(ClipboardItem::new_string(
+                            dc.to_string_lossy().into_owned(),
+                        ));
+                    }))
+                    .into_any_element(),
+                );
+                // Reveal-in-Finder / terminal only make sense for local folders.
+                if !is_remote {
+                    let dr = dir.clone();
+                    items.push(
+                        ctx_item("Reveal in Finder", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.close_sidebar_menu(cx);
+                            let _ = Command::new("open").arg(&dr).spawn();
+                        }))
+                        .into_any_element(),
+                    );
+                }
+            }
         }
         if items.is_empty() {
             items.push(ctx_disabled("没有可用的操作").into_any_element());
@@ -8408,27 +8876,7 @@ impl Shuffle {
 
     /// Read-only scroll indicator for the palette results list.
     fn palette_scrollbar_thumb(&self) -> Option<AnyElement> {
-        let base = &self.palette_scroll;
-        let viewport = f64::from(base.bounds().size.height) as f32;
-        let max = f64::from(base.max_offset().height) as f32;
-        if viewport <= 1.0 || max <= 1.0 {
-            return None;
-        }
-        let scrolled = (-(f64::from(base.offset().y) as f32)).clamp(0.0, max);
-        let content = viewport + max;
-        let thumb_h = (viewport * viewport / content).clamp(20.0, viewport);
-        let thumb_top = (viewport - thumb_h) * (scrolled / max);
-        Some(
-            div()
-                .absolute()
-                .top(px(thumb_top))
-                .right(px(2.0))
-                .w(px(6.0))
-                .h(px(thumb_h))
-                .rounded_full()
-                .bg(Theme::alpha(theme().text, 0x44))
-                .into_any_element(),
-        )
+        static_scrollbar_thumb(&self.palette_scroll)
     }
 
     fn activate_selection(&mut self, cx: &mut Context<Self>) {
@@ -10252,6 +10700,36 @@ impl Shuffle {
 
     /// Close a tab. Closing a pane's last tab removes the pane (collapsing the
     /// split); closing the last tab of the last pane is a no-op.
+    /// Open a copy of `tab` (same folder) right after it in the same pane.
+    fn duplicate_tab(&mut self, pane: usize, tab: usize, cx: &mut Context<Self>) {
+        if pane >= self.panes.len() || tab >= self.panes[pane].tabs.len() {
+            return;
+        }
+        let dir = self.panes[pane].tabs[tab].current_dir.clone();
+        let remote = self.panes[pane].tabs[tab].remote.clone();
+        let mut new = Tab::new(dir);
+        new.remote = remote;
+        let p = self.pane_mut(pane);
+        p.tabs.insert(tab + 1, new);
+        p.active = tab + 1;
+        self.active_pane = pane;
+        self.reload_pane(pane, cx);
+    }
+
+    /// Close every tab in `pane` except `keep`.
+    fn close_other_tabs(&mut self, pane: usize, keep: usize, cx: &mut Context<Self>) {
+        if pane >= self.panes.len() || keep >= self.panes[pane].tabs.len() {
+            return;
+        }
+        let kept = self.panes[pane].tabs.remove(keep);
+        let p = self.pane_mut(pane);
+        p.tabs.clear();
+        p.tabs.push(kept);
+        p.active = 0;
+        self.active_pane = pane;
+        cx.notify();
+    }
+
     fn close_tab(&mut self, pane: usize, tab: usize, cx: &mut Context<Self>) {
         if pane >= self.panes.len() || tab >= self.panes[pane].tabs.len() {
             return;
@@ -10479,6 +10957,66 @@ impl Shuffle {
         self.focus_entry(pane, path, cx);
     }
 
+    /// Shift-click range select within one Column-view column: select every item
+    /// between the anchor and `target` in that column's listing. Falls back to a
+    /// single selection when the anchor isn't in this column.
+    fn range_select_column(
+        &mut self,
+        pane: usize,
+        col_index: usize,
+        target: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        // The directory this column lists: column 0 is the current dir, deeper
+        // columns come from the drill-in chain.
+        let dir = if col_index == 0 {
+            self.tab(pane).current_dir.clone()
+        } else {
+            match self.tab(pane).col_chain.get(col_index - 1) {
+                Some(d) => d.clone(),
+                None => return,
+            }
+        };
+        let paths: Vec<PathBuf> = column_entries(&dir, prefs().show_hidden)
+            .iter()
+            .map(|e| dir.join(&e.name))
+            .collect();
+        let to = paths.iter().position(|p| p == &target);
+        let from = self
+            .tab(pane)
+            .anchor
+            .as_ref()
+            .and_then(|a| paths.iter().position(|p| p == a));
+        let sel: HashSet<PathBuf> = match (from, to) {
+            (Some(a), Some(b)) => {
+                let (lo, hi) = (a.min(b), a.max(b));
+                paths[lo..=hi].iter().cloned().collect()
+            }
+            _ => std::iter::once(target.clone()).collect(),
+        };
+        // Don't extend the drill-in past this column while range-selecting.
+        self.tab_mut(pane).col_chain.truncate(col_index);
+        self.tab_mut(pane).selection = sel;
+        cx.notify();
+    }
+
+    /// Whether a marquee drag is in flight with real displacement — used to
+    /// swallow the row click that lands on the same mouse-up (row `on_click`
+    /// bubbles before the root's `end_marquee`), so finishing a box-select over
+    /// a row doesn't replace the fresh multi-selection with that one row.
+    /// Stationary press-releases (displacement ≈ 0) still click through.
+    fn marquee_click_suppressed(&self) -> bool {
+        self.marquee.is_some_and(|(pane, s, c)| {
+            // The anchor is content-space; convert the cursor before comparing
+            // (comparing across spaces would suppress every click once the
+            // list is scrolled). Scroll during the marquee counts as movement —
+            // exactly then must the click not collapse the selection.
+            let (top, scrolled) = self.list_geometry(pane);
+            let cur_c = c.1 - top + scrolled;
+            (c.0 - s.0).abs().max((cur_c - s.1).abs()) > 6.0
+        })
+    }
+
     /// Dispatch a left-click on an item, honoring Cmd / Shift modifiers.
     fn click_entry(
         &mut self,
@@ -10488,6 +11026,9 @@ impl Shuffle {
         ev: &ClickEvent,
         cx: &mut Context<Self>,
     ) {
+        if self.marquee_click_suppressed() {
+            return;
+        }
         self.active_pane = pane;
         self.term_focused = false;
         let mods = ev.modifiers();
@@ -10504,8 +11045,26 @@ impl Shuffle {
         }
     }
 
+    /// A pane list's `(viewport_top, scrolled)` in window coords / content px —
+    /// the numbers needed to convert between window y and content y.
+    fn list_geometry(&self, pane: usize) -> (f32, f32) {
+        let st = self.tab(pane).scroll_handle.0.borrow();
+        let top = f64::from(st.base_handle.bounds().origin.y) as f32;
+        let scrolled = (-(f64::from(st.base_handle.offset().y) as f32)).max(0.0);
+        (top, scrolled)
+    }
+
     /// Start a marquee (rubber-band) selection from empty list space.
+    ///
+    /// The anchor is stored in CONTENT coordinates (`y - list_top + scrolled`),
+    /// not window coordinates: the list can scroll underneath an in-flight
+    /// marquee (wheel/trackpad, or edge auto-scroll), and a window-space anchor
+    /// would slide with the scroll — moving the box off the rows it had already
+    /// swept and re-selecting the wrong ones.
     fn begin_marquee(&mut self, pane: usize, x: f32, y: f32, cx: &mut Context<Self>) {
+        if mq_log() {
+            eprintln!("[mq] begin pane={pane} at ({x:.0},{y:.0})");
+        }
         self.active_pane = pane;
         self.term_focused = false;
         self.rename = None;
@@ -10515,8 +11074,115 @@ impl Shuffle {
             tab.anchor = None;
             tab.selection_anchor = None;
         }
-        self.marquee = Some((pane, (x, y), (x, y)));
+        let (top, scrolled) = self.list_geometry(pane);
+        self.marquee = Some((pane, (x, y - top + scrolled), (x, y)));
+        // Auto-scroll while the drag sits past the top/bottom edge of the list,
+        // so a marquee can keep selecting through folders taller than the view.
+        // A timer loop (not mouse-move driven) so it scrolls even while the
+        // cursor holds still past the edge; it exits when the marquee ends.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                let alive = this
+                    .update(cx, |this, cx| {
+                        if this.marquee.is_none() {
+                            return false;
+                        }
+                        this.marquee_autoscroll_tick(cx);
+                        true
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
         cx.notify();
+    }
+
+    /// One 16ms step for an active marquee. Recomputes the selection against
+    /// the CURRENT scroll position (the wheel/trackpad can scroll the list
+    /// mid-marquee with no mouse-move event — the content-space anchor stays
+    /// glued, and the rows under the box change), then, if the pointer sits in
+    /// an edge zone, auto-scrolls — slow near the edge, faster further past it.
+    fn marquee_autoscroll_tick(&mut self, cx: &mut Context<Self>) {
+        let Some((pane, _, cur)) = self.marquee else {
+            return;
+        };
+        if pane >= self.panes.len() {
+            return;
+        }
+        // Track external scrolls: re-derive selection + box from the live
+        // scroll offset every tick (cheap — only the covered rows).
+        self.update_marquee(cur.0, cur.1, cx);
+        let Some((pane, start, cur)) = self.marquee else {
+            return;
+        };
+        // Distance past the viewport edge decides direction and speed.
+        let (top, bottom, scrolled, max) = {
+            let st = self.tab(pane).scroll_handle.0.borrow();
+            let b = st.base_handle.bounds();
+            let top = f64::from(b.origin.y) as f32;
+            let bottom = top + f64::from(b.size.height) as f32;
+            let scrolled = (-(f64::from(st.base_handle.offset().y) as f32)).max(0.0);
+            let max = f64::from(st.base_handle.max_offset().height) as f32;
+            (top, bottom, scrolled, max)
+        };
+        if max <= 1.0 {
+            return; // everything fits; nothing to scroll
+        }
+        // Scroll when the cursor is within an edge ZONE inside the viewport, not
+        // only past the edge — when the list reaches the window bottom the
+        // cursor may never report coordinates beyond it. Zone-scrolling only
+        // engages once the box has actually been dragged a little, so a plain
+        // press inside a zone doesn't scroll; after that the zone side alone
+        // picks the direction (an anchor-side gate here would block reversing:
+        // after a long down-scroll the glued anchor clamps to the top edge and
+        // no reachable in-zone position passes it).
+        const ZONE: f32 = 28.0;
+        // `start` is content-space; convert the cursor for the displacement gate.
+        let cur_content_y = cur.1 - top + scrolled;
+        let moved =
+            (cur.0 - start.0).abs().max((cur_content_y - start.1).abs()) > 8.0;
+        let overshoot = if moved && cur.1 < top + ZONE {
+            (cur.1 - (top + ZONE)).min(-0.1) // negative → scroll up
+        } else if moved && cur.1 > bottom - ZONE {
+            (cur.1 - (bottom - ZONE)).max(0.1) // positive → scroll down
+        } else {
+            if mq_log() {
+                eprintln!(
+                    "[mq] tick idle: cur.y={:.0} top={top:.0} bottom={bottom:.0} moved={moved} zone={ZONE}",
+                    cur.1
+                );
+            }
+            return; // outside both zones, or the box hasn't been dragged yet
+        };
+        if mq_log() {
+            eprintln!(
+                "[mq] tick scroll: cur.y={:.0} overshoot={overshoot:.0} scrolled={scrolled:.0}/{max:.0}",
+                cur.1
+            );
+        }
+        // ~2px/tick at the zone boundary up to ~28px/tick (≈1700px/s) far past
+        // the edge — "slowly or faster depending on where the mouse is".
+        let speed = (overshoot.abs() * 0.22).clamp(2.0, 28.0);
+        let target = (scrolled + speed.copysign(overshoot)).clamp(0.0, max);
+        let applied = target - scrolled;
+        if applied.abs() < 0.5 {
+            return; // already at that end of the list
+        }
+        {
+            let st = self.tab(pane).scroll_handle.0.borrow();
+            let x = st.base_handle.offset().x;
+            st.base_handle.set_offset(point(x, px(-target)));
+        }
+        let _ = applied; // the content-space anchor is scroll-invariant
+        self.mark_scrolled(pane, cx); // show the scrollbar while auto-scrolling
+        // Recompute the covered rows against the new scroll position.
+        self.update_marquee(cur.0, cur.1, cx);
     }
 
     /// Update the marquee end point and recompute which rows it covers.
@@ -10524,19 +11190,17 @@ impl Shuffle {
         let Some((pane, start, _)) = self.marquee else {
             return;
         };
+        if mq_log() {
+            eprintln!("[mq] move ({x:.0},{y:.0})");
+        }
         self.marquee = Some((pane, start, (x, y)));
 
         // Map the vertical span to row indices using the list's geometry.
-        let (list_top, scrolled) = {
-            let st = self.tab(pane).scroll_handle.0.borrow();
-            let top = f64::from(st.base_handle.bounds().origin.y) as f32;
-            let scr = (-(f64::from(st.base_handle.offset().y) as f32)).max(0.0);
-            (top, scr)
-        };
-        let y0 = start.1.min(y);
-        let y1 = start.1.max(y);
-        let c0 = (y0 - list_top + scrolled).max(0.0);
-        let c1 = (y1 - list_top + scrolled).max(0.0);
+        let (list_top, scrolled) = self.list_geometry(pane);
+        // The anchor (`start.1`) is content-space; only the cursor converts.
+        let cur_c = y - list_top + scrolled;
+        let c0 = start.1.min(cur_c).max(0.0);
+        let c1 = start.1.max(cur_c).max(0.0);
         let i0 = (c0 / ROW_H).floor() as i64;
         let i1 = (c1 / ROW_H).floor() as i64;
         // Row 0 is the ".." entry when present; offset to display indices.
@@ -10723,10 +11387,21 @@ impl Shuffle {
             let o = st.base_handle.bounds().origin;
             (f64::from(o.x) as f32, f64::from(o.y) as f32)
         };
+        // The anchor is content-space: convert to window y with the LIVE scroll
+        // offset, so the box's fixed edge glides with the content when the list
+        // scrolls under an in-flight marquee.
+        let (_, scrolled) = self.list_geometry(pane);
+        let start_y = start.1 + oy - scrolled;
         let x = start.0.min(cur.0) - ox;
-        let y = start.1.min(cur.1) - oy;
+        let y = start_y.min(cur.1) - oy;
         let w = (start.0 - cur.0).abs();
-        let h = (start.1 - cur.1).abs();
+        let mut h = (start_y - cur.1).abs();
+        // Clamp to the container: when the anchored edge has scrolled off the
+        // top, shrink the height by the clipped amount (clamping only `top`
+        // would push the box's far edge past the cursor).
+        if y < 0.0 {
+            h = (h + y).max(0.0);
+        }
         let t = theme();
         Some(
             div()
@@ -10790,6 +11465,7 @@ impl Shuffle {
             tab.selection.clear();
             tab.selection.insert(target.clone());
             tab.selection_anchor = Some(target.clone());
+            // Anchor this item so a following Shift-click can range from it.
             tab.anchor = Some(target);
             cx.notify();
         } else {
@@ -12673,6 +13349,18 @@ impl Shuffle {
             .overflow_hidden()
             .border_b_1()
             .border_color(rgb(theme().border))
+            // Right-click the nav bar → New Tab / Copy Path / Reveal in Finder.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    let (x, y) = (
+                        f64::from(ev.position.x) as f32,
+                        f64::from(ev.position.y) as f32,
+                    );
+                    this.open_sidebar_menu(x, y, SidebarTarget::NavBar(pane), cx);
+                    cx.stop_propagation();
+                }),
+            )
             .child(nav_arrow(
                 ("nav-back", pane),
                 "‹",
@@ -12736,6 +13424,51 @@ impl Shuffle {
                     this.toggle_palette(window, cx);
                 }
             }));
+        // New Folder — creates a folder in this pane and drops into rename.
+        // Remote tabs can't create folders locally, so hide it there.
+        let is_remote = self.tab(pane).remote.is_some();
+        let new_folder_btn = div()
+            .id(("tb-new-folder", pane))
+            .flex_none()
+            .w(px(24.0))
+            .h(px(22.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .cursor_pointer()
+            .text_color(rgb(t.text_dim))
+            .hover(|s| s.bg(rgb(t.hover)).text_color(rgb(t.text)))
+            .child("🗀")
+            .tooltip(tip("New Folder (⇧⌘N)"))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.active_pane = pane;
+                this.new_folder(pane, window, cx);
+            }));
+        // Delete — Trash the selection; greyed out when nothing is selected.
+        let has_sel =
+            !self.tab(pane).selection.is_empty() || self.tab(pane).anchor.is_some();
+        let delete_btn = div()
+            .id(("tb-delete", pane))
+            .flex_none()
+            .w(px(24.0))
+            .h(px(22.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .when(has_sel, |d| d.text_color(rgb(t.text_dim)))
+            .when(!has_sel, |d| d.text_color(Theme::alpha(t.text_dim, 0x66)))
+            .child("🗑")
+            .tooltip(tip(if has_sel { "Move to Trash (⌫)" } else { "Move to Trash (select an item first)" }))
+            .when(has_sel, |d| {
+                d.cursor_pointer()
+                    .hover(|s| s.bg(rgb(t.hover)).text_color(rgb(t.text)))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.active_pane = pane;
+                        this.request_delete(pane, cx);
+                    }))
+            });
         // Sort has no effect in Column view (columns are always folders-first,
         // by name), so grey it out and make it inert there rather than misleading.
         let sort_enabled = view != ViewMode::Columns;
@@ -12773,6 +13506,8 @@ impl Shuffle {
             .items_center()
             .gap_1()
             .pl_2()
+            // File actions (hidden on remote tabs, which can't create locally).
+            .when(!is_remote, |d| d.child(new_folder_btn).child(delete_btn))
             .child(search_btn)
             .child(btn("view-list", "☰", "List view", ViewMode::List, cx))
             .child(btn("view-icons", "▦", "Icon view", ViewMode::Icons, cx))
@@ -13096,6 +13831,18 @@ impl Shuffle {
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.select_tab(pane, i, cx);
                     }))
+                    // Right-click → tab context menu (New/Duplicate/Close/…).
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                            let (x, y) = (
+                                f64::from(ev.position.x) as f32,
+                                f64::from(ev.position.y) as f32,
+                            );
+                            this.open_sidebar_menu(x, y, SidebarTarget::Tab(pane, i), cx);
+                            cx.stop_propagation();
+                        }),
+                    )
                     .child(
                         div()
                             .min_w_0()
@@ -13310,12 +14057,19 @@ impl Shuffle {
                                                     this.open_context_menu(pane, x, y, None, cx);
                                                 }),
                                             )
-                                            // Press on empty space → start a marquee
-                                            // (rows stop_propagation so this only
-                                            // fires on blank area).
+                                            // Press on blank space, or on a row's
+                                            // Kind/Date/Size area (only the name
+                                            // cell stops propagation), → start a
+                                            // marquee. Skip modified presses so
+                                            // Cmd/Shift-click keep their toggle /
+                                            // range-extend meaning (a marquee
+                                            // start would clear the selection).
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                                                    if ev.modifiers.platform || ev.modifiers.shift {
+                                                        return;
+                                                    }
                                                     this.begin_marquee(
                                                         pane,
                                                         f64::from(ev.position.x) as f32,
@@ -13348,6 +14102,7 @@ impl Shuffle {
                                         "..",
                                         true,
                                         0,
+                                        None,        // no size for the ".." row
                                         None,
                                         true,        // ".." has no metadata to load
                                         row_key,
@@ -13362,6 +14117,11 @@ impl Shuffle {
                                         cx.listener({
                                             let parent = parent.clone();
                                             move |this, _: &ClickEvent, _, cx| {
+                                                // Finishing a marquee over ".." must
+                                                // not navigate away.
+                                                if this.marquee_click_suppressed() {
+                                                    return;
+                                                }
                                                 this.navigate_in(pane, parent.clone(), cx);
                                             }
                                         }),
@@ -13409,6 +14169,17 @@ impl Shuffle {
                             let entry_loaded = entry.loaded;
                             let target = base_dir.join(&name);
                             let cloud = this.cloud_state(&target, is_dir);
+                            // Folder sizes: look up the cached total, kicking off
+                            // a background sum on first sight (List view only).
+                            let folder_size = if is_dir && tab.remote.is_none() {
+                                let fs = folder_size_lookup(&target);
+                                if fs.is_none() {
+                                    this.ensure_folder_size(target.clone(), cx);
+                                }
+                                fs
+                            } else {
+                                None
+                            };
                             let ctx_target = target.clone();
                             let drop_target = target.clone();
                             let hover_target = target.clone();
@@ -13436,6 +14207,7 @@ impl Shuffle {
                                     &display_name,
                                     is_dir,
                                     entry_size,
+                                    folder_size,
                                     modified,
                                     entry_loaded,
                                     row_key,
@@ -13614,19 +14386,29 @@ impl Shuffle {
                 let ctx_active = self.is_ctx_target(&target);
                 rows.push(column_row(pane, i, &e.name, target, e.is_dir, selected, ctx_active, cx));
             }
+            let vscroll = col_scroll(pane, i);
+            let thumb = static_scrollbar_thumb(&vscroll);
             cols.push(
                 div()
                     .id(("col", pane * 100 + i))
+                    .relative()
                     .flex_none()
                     .w(px(230.0))
                     .h_full()
-                    .overflow_y_scroll()
                     .border_r_1()
                     .border_color(rgb(t.border))
-                    .flex()
-                    .flex_col()
-                    .py_1()
-                    .children(rows)
+                    .child(
+                        div()
+                            .id(("col-scroll", pane * 100 + i))
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&vscroll)
+                            .flex()
+                            .flex_col()
+                            .py_1()
+                            .children(rows),
+                    )
+                    .children(thumb)
                     .into_any_element(),
             );
         }
@@ -13933,6 +14715,68 @@ impl Render for Shuffle {
                     this.go_forward(pane, cx);
                 }),
             )
+            // Native menu-bar actions (File / View / Go menus).
+            .on_action(cx.listener(|this, _: &NewTab, _, cx| {
+                let p = this.active_pane;
+                this.new_tab_in(p, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NewFolder, window, cx| {
+                let p = this.active_pane;
+                this.new_folder(p, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseTab, _, cx| {
+                let p = this.active_pane;
+                let t = this.pane(p).active;
+                this.close_tab(p, t, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MoveToTrash, _, cx| {
+                let p = this.active_pane;
+                this.request_delete(p, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ViewList, _, cx| {
+                let p = this.active_pane;
+                this.set_view(p, ViewMode::List, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ViewIcons, _, cx| {
+                let p = this.active_pane;
+                this.set_view(p, ViewMode::Icons, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ViewColumns, _, cx| {
+                let p = this.active_pane;
+                this.set_view(p, ViewMode::Columns, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ViewGallery, _, cx| {
+                let p = this.active_pane;
+                this.set_view(p, ViewMode::Gallery, cx);
+            }))
+            .on_action(cx.listener(|_, _: &ToggleSidebar, _, cx| {
+                let mut np = prefs();
+                np.sidebar_collapsed = !np.sidebar_collapsed;
+                apply_prefs(np, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &GoBack, _, cx| {
+                let p = this.active_pane;
+                this.go_back(p, cx);
+            }))
+            .on_action(cx.listener(|this, _: &GoForward, _, cx| {
+                let p = this.active_pane;
+                this.go_forward(p, cx);
+            }))
+            .on_action(cx.listener(|this, _: &GoHome, _, cx| {
+                this.navigate_to(home_dir(), cx);
+            }))
+            .on_action(cx.listener(|this, _: &GoApplications, _, cx| {
+                this.navigate_to(PathBuf::from("/Applications"), cx);
+            }))
+            .on_action(cx.listener(|this, _: &GoComputer, _, cx| {
+                this.navigate_to(PathBuf::from("/"), cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
+                if !this.palette_open {
+                    this.toggle_palette(window, cx);
+                }
+            }))
             // Track column drags anywhere in the window so the cursor can leave
             // the thin handle without dropping the resize.
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
@@ -14884,6 +15728,12 @@ fn cloud_kind(path: &Path) -> Option<CloudKind> {
 }
 
 /// Whether `path` is an online-only cloud placeholder (kernel `SF_DATALESS`).
+/// Whether marquee debug logging is on (`SHUFFLE_MARQUEE_LOG=1`).
+fn mq_log() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SHUFFLE_MARQUEE_LOG").is_some())
+}
+
 fn is_dataless(path: &Path) -> bool {
     use std::os::macos::fs::MetadataExt;
     fs::metadata(path)
@@ -15714,6 +16564,8 @@ fn file_row(
     display_name: &str,
     is_dir: bool,
     size: u64,
+    // For folders: the recursively-summed size once computed (else None → "--").
+    folder_size: Option<u64>,
     modified: Option<SystemTime>,
     loaded: bool,
     key: usize,
@@ -15846,13 +16698,14 @@ fn file_row(
         // Instant press feedback (the click action lands on mouse-up).
         .active(|s| s.bg(rgb(t.selected)))
         .on_hover(on_hover_row)
-        // Press records a drag candidate (promoted to a native OS drag on move)
-        // and stops a marquee from starting on the list behind it.
-        .on_mouse_down(MouseButton::Left, on_press)
         // Name (icon + label). Long names truncate with an ellipsis. Only this
         // cell is the "drop into this folder" target — dropping further along
         // the row (Kind/Date/Size) falls through to the pane and lands in the
-        // current directory instead, like Finder.
+        // current directory instead, like Finder. It's also the only cell whose
+        // press starts a FILE drag (candidate promoted to a native OS drag on
+        // move); presses on Kind/Date/Size fall through to the list behind, so
+        // a rubber-band marquee can start from a row's non-name area even in a
+        // folder whose rows fill the whole viewport — like Finder.
         .child(
             div()
                 .flex_none()
@@ -15867,6 +16720,7 @@ fn file_row(
                 .items_center()
                 .gap_2()
                 .pr_2()
+                .on_mouse_down(MouseButton::Left, on_press)
                 .when(accept_drop, |c| c.rounded_sm().on_drop(on_drop_file))
                 .when(drop_hilite, |c| c.bg(rgb(theme().selected)))
                 .child(
@@ -15907,7 +16761,17 @@ fn file_row(
                 .flex()
                 .justify_end()
                 .text_color(meta_color)
-                .child(if loaded { format_size(is_dir, size) } else { "--".to_string() }),
+                .child(if !loaded {
+                    "--".to_string()
+                } else if is_dir {
+                    // Folder size once summed; sentinel/none → "--".
+                    match folder_size {
+                        Some(s) if s != u64::MAX => format_size(false, s),
+                        _ => "--".to_string(),
+                    }
+                } else {
+                    format_size(is_dir, size)
+                }),
         )
         // Slack space after the last column (keeps row hover full-width).
         .child(div().flex_1())
@@ -16439,6 +17303,46 @@ fn read_subdirs(dir: &Path, show_hidden: bool) -> (Vec<PathBuf>, Option<SystemTi
     });
     let mtime = fs::metadata(dir).ok().and_then(|m| m.modified().ok());
     (out, mtime)
+}
+
+/// Recursively-summed folder sizes for List view, computed off-thread and
+/// cached (a folder can hold millions of files; we never walk on the render
+/// thread). `u64::MAX` is a sentinel: the folder blew past the entry cap, so we
+/// show "--" rather than a wrong number.
+static FOLDER_SIZE: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+static FOLDER_SIZE_PENDING: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+/// Stop summing a folder past this many entries (bounds cost on huge trees like
+/// `/` or a home with node_modules); such folders show "--".
+const FOLDER_SIZE_CAP: usize = 400_000;
+
+fn folder_size_lookup(path: &Path) -> Option<u64> {
+    FOLDER_SIZE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .get(path)
+        .copied()
+}
+
+/// Total bytes of all files under `dir` (jwalk, parallel, symlinks not
+/// followed). Returns `u64::MAX` if the tree exceeds [`FOLDER_SIZE_CAP`].
+fn dir_total_size(dir: &Path) -> u64 {
+    let mut total: u64 = 0;
+    let mut count: usize = 0;
+    for entry in jwalk::WalkDir::new(dir).skip_hidden(false) {
+        count += 1;
+        if count > FOLDER_SIZE_CAP {
+            return u64::MAX;
+        }
+        if let Ok(e) = entry {
+            if let Ok(m) = e.metadata() {
+                if m.is_file() {
+                    total += m.len();
+                }
+            }
+        }
+    }
+    total
 }
 
 /// `stat` results for sidebar rows (bookmarks, group members, favorites),
@@ -17555,6 +18459,51 @@ fn start_os_file_drag(view_ptr: *mut std::ffi::c_void, paths: &[PathBuf]) {
     let source_proto: &ProtocolObject<dyn NSDraggingSource> = ProtocolObject::from_ref(&*source);
     SHUFFLE_FILE_DRAG_LIVE.store(true, Ordering::Relaxed);
     let _ = view.beginDraggingSessionWithItems_event_source(&array, &event, source_proto);
+}
+
+thread_local! {
+    /// Persistent vertical scroll handles for Column view, keyed by (pane,
+    /// column index) so each column keeps its scroll position across frames and
+    /// we can read its offset to draw a scrollbar thumb.
+    static COL_SCROLLS: RefCell<HashMap<(usize, usize), gpui::ScrollHandle>> =
+        RefCell::new(HashMap::new());
+}
+
+/// The persistent scroll handle for one Column-view column.
+fn col_scroll(pane: usize, col: usize) -> gpui::ScrollHandle {
+    COL_SCROLLS.with(|m| {
+        m.borrow_mut()
+            .entry((pane, col))
+            .or_insert_with(gpui::ScrollHandle::new)
+            .clone()
+    })
+}
+
+/// A minimal, non-interactive vertical scrollbar thumb for any tracked
+/// `ScrollHandle`. Returns `None` when the content fits (nothing to scroll).
+/// Used by the palette, Settings, and column view (the main list has its own
+/// richer draggable/fading bar).
+fn static_scrollbar_thumb(base: &gpui::ScrollHandle) -> Option<AnyElement> {
+    let viewport = f64::from(base.bounds().size.height) as f32;
+    let max = f64::from(base.max_offset().height) as f32;
+    if viewport <= 1.0 || max <= 1.0 {
+        return None;
+    }
+    let scrolled = (-(f64::from(base.offset().y) as f32)).clamp(0.0, max);
+    let content = viewport + max;
+    let thumb_h = (viewport * viewport / content).clamp(20.0, viewport);
+    let thumb_top = (viewport - thumb_h) * (scrolled / max);
+    Some(
+        div()
+            .absolute()
+            .top(px(thumb_top))
+            .right(px(2.0))
+            .w(px(6.0))
+            .h(px(thumb_h))
+            .rounded_full()
+            .bg(Theme::alpha(theme().text, 0x44))
+            .into_any_element(),
+    )
 }
 
 /// Build a `.tooltip(...)` callback showing `text` in a small floating label.
@@ -20011,7 +20960,7 @@ fn load_prefs() -> Prefs {
                     "waterfall" => p.waterfall = on,
                     "palette_opacity" => {
                         if let Ok(n) = v.trim().parse::<u8>() {
-                            p.palette_opacity = n.clamp(40, 100);
+                            p.palette_opacity = n.clamp(20, 100);
                         }
                     }
                     _ => {}
@@ -20416,14 +21365,49 @@ fn main() {
             KeyBinding::new("cmd-,", OpenSettings, None),
             KeyBinding::new("cmd-q", Quit, None),
         ]);
-        cx.set_menus(vec![Menu {
-            name: "Shuffle".into(),
-            items: vec![
-                MenuItem::action("设置…", OpenSettings),
-                MenuItem::separator(),
-                MenuItem::action("退出 Shuffle", Quit),
-            ],
-        }]);
+        cx.set_menus(vec![
+            Menu {
+                name: "Shuffle".into(),
+                items: vec![
+                    MenuItem::action("设置…", OpenSettings),
+                    MenuItem::separator(),
+                    MenuItem::action("退出 Shuffle", Quit),
+                ],
+            },
+            Menu {
+                name: "File".into(),
+                items: vec![
+                    MenuItem::action("New Tab", NewTab),
+                    MenuItem::action("New Folder", NewFolder),
+                    MenuItem::separator(),
+                    MenuItem::action("Close Tab", CloseTab),
+                    MenuItem::action("Move to Trash", MoveToTrash),
+                ],
+            },
+            Menu {
+                name: "View".into(),
+                items: vec![
+                    MenuItem::action("as List", ViewList),
+                    MenuItem::action("as Icons", ViewIcons),
+                    MenuItem::action("as Columns", ViewColumns),
+                    MenuItem::action("as Gallery", ViewGallery),
+                    MenuItem::separator(),
+                    MenuItem::action("Hide/Show Sidebar", ToggleSidebar),
+                    MenuItem::action("Search…", FocusSearch),
+                ],
+            },
+            Menu {
+                name: "Go".into(),
+                items: vec![
+                    MenuItem::action("Back", GoBack),
+                    MenuItem::action("Forward", GoForward),
+                    MenuItem::separator(),
+                    MenuItem::action("Home", GoHome),
+                    MenuItem::action("Applications", GoApplications),
+                    MenuItem::action("Computer", GoComputer),
+                ],
+            },
+        ]);
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         cx.on_action(|_: &OpenSettings, cx: &mut App| open_settings_window(cx));
 

@@ -1,4 +1,10 @@
 #!/bin/bash
+# LOCAL / emergency release path. The CANONICAL release is now the CI workflow
+# (.github/workflows/release.yml): push a tag `vX.Y.Z` and GitHub builds,
+# notarizes, and — crucially — records a build-provenance attestation that ties
+# the DMG to the source commit. DMGs built here locally are signed + notarized
+# but NOT attested, so users can't `gh attestation verify` them. Prefer tagging.
+#
 # Cut a new Shuffle release and publish it to GitHub as the "latest" release,
 # so the website's fixed download link always serves the newest version.
 #
@@ -29,6 +35,9 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
 fi
 
 echo "==> Building signed + notarized $DMG (universal: arm64 + x86_64)"
+# Bake the commit into the binary so Settings shows "Version X (sha)" —
+# otherwise released builds read "(dev)" and can't be told apart.
+export SHUFFLE_BUILD_SHA="$(git rev-parse --short HEAD)"
 # Build both slices so the release runs on Apple Silicon and Intel Macs;
 # make_app.sh lipos them into one universal binary.
 cargo build --release --target aarch64-apple-darwin
