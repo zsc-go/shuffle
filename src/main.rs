@@ -4178,6 +4178,9 @@ struct Shuffle {
     /// The most recent unmodified item click, used as a fallback when the UI
     /// framework does not preserve a native double-click count.
     last_entry_click: Option<(usize, PathBuf, Instant)>,
+    /// An item opened from its native second mouse-down. Its following mouse-up
+    /// click must not select the stale row after navigation has already started.
+    mouse_down_activation: Option<(usize, PathBuf, Instant)>,
     /// A left-press on a draggable row: (pane, path, press position). Promoted to
     /// a native OS drag once the cursor moves past a small threshold.
     drag_candidate: Option<(usize, PathBuf, (f32, f32))>,
@@ -4519,6 +4522,7 @@ impl Shuffle {
             next_load_gen: 0,
             marquee: None,
             last_entry_click: None,
+            mouse_down_activation: None,
             drag_candidate: None,
             server_dialog: None,
             ssh_ask: false,
@@ -11075,6 +11079,9 @@ impl Shuffle {
         ev: &ClickEvent,
         cx: &mut Context<Self>,
     ) {
+        if self.consume_mouse_down_activation(pane, &path) {
+            return;
+        }
         if self.marquee_click_suppressed() {
             return;
         }
@@ -11109,6 +11116,36 @@ impl Shuffle {
             self.last_entry_click = Some((pane, path.to_path_buf(), now));
             false
         }
+    }
+
+    /// Handle a native second press before the list's drag/marquee machinery can
+    /// swallow the matching mouse-up click. GPUI exposes the physical click count
+    /// on `MouseDownEvent` even on paths where `ClickEvent` is lost.
+    fn native_double_press(
+        &mut self,
+        pane: usize,
+        path: &Path,
+        ev: &MouseDownEvent,
+    ) -> bool {
+        if ev.click_count < 2 || ev.modifiers.platform || ev.modifiers.shift {
+            return false;
+        }
+        self.last_entry_click = None;
+        self.mouse_down_activation = Some((pane, path.to_path_buf(), Instant::now()));
+        true
+    }
+
+    /// Consume the mouse-up click which follows an activation performed from a
+    /// second native press. A different or stale click is allowed through and
+    /// clears the marker.
+    fn consume_mouse_down_activation(&mut self, pane: usize, path: &Path) -> bool {
+        self.mouse_down_activation
+            .take()
+            .is_some_and(|(activated_pane, activated_path, at)| {
+                activated_pane == pane
+                    && activated_path == path
+                    && at.elapsed() <= ENTRY_DOUBLE_CLICK_WINDOW
+            })
     }
 
     /// A pane list's `(viewport_top, scrolled)` in window coords / content px —
@@ -11495,6 +11532,9 @@ impl Shuffle {
         ev: &ClickEvent,
         cx: &mut Context<Self>,
     ) {
+        if self.consume_mouse_down_activation(pane, &target) {
+            return;
+        }
         self.active_pane = pane;
         self.term_focused = false;
         let mods = ev.modifiers();
@@ -14313,6 +14353,12 @@ impl Shuffle {
                                     }),
                                     cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                                         if let Some(dp) = &drag_target {
+                                            if this.native_double_press(pane, dp, ev) {
+                                                this.drag_candidate = None;
+                                                this.open_path(pane, dp.clone(), is_dir, cx);
+                                                cx.stop_propagation();
+                                                return;
+                                            }
                                             let (x, y) = (
                                                 f64::from(ev.position.x) as f32,
                                                 f64::from(ev.position.y) as f32,
@@ -16900,6 +16946,12 @@ fn icon_cell(
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                if this.native_double_press(pane, &press_t, ev) {
+                    this.drag_candidate = None;
+                    this.open_path(pane, press_t.clone(), is_dir, cx);
+                    cx.stop_propagation();
+                    return;
+                }
                 let (x, y) = (
                     f64::from(ev.position.x) as f32,
                     f64::from(ev.position.y) as f32,
@@ -16979,6 +17031,16 @@ fn column_row(
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                if this.native_double_press(pane, &press_t, ev) {
+                    this.drag_candidate = None;
+                    if is_dir {
+                        this.navigate_in(pane, press_t.clone(), cx);
+                    } else {
+                        this.open_path(pane, press_t.clone(), false, cx);
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
                 let (x, y) = (
                     f64::from(ev.position.x) as f32,
                     f64::from(ev.position.y) as f32,
